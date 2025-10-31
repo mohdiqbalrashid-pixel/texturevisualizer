@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 import io
 
-st.title("Textured Paint Color Changer (Improved Color Accuracy)")
+st.title("Textured Paint Color Changer (RGB + Auto Brightness Matching)")
 
 # Upload image
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
@@ -24,6 +24,9 @@ if uploaded_file is not None:
 
     new_color_rgb = (r, g, b)
 
+    # Compute Y (luminance) from RGB using Rec.601 formula
+    target_Y = 0.299 * r + 0.587 * g + 0.114 * b
+
     # Convert image to Lab color space
     lab_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
 
@@ -34,8 +37,9 @@ if uploaded_file is not None:
     # Compute mean L of image
     mean_L = np.mean(lab_img[:, :, 0])
 
-    # Adjust L channel toward target color's L while preserving texture contrast
-    lab_img[:, :, 0] = np.clip(lab_img[:, :, 0] * (color_lab[0] / mean_L), 0, 255)
+    # Adjust L channel based on target luminance (Y)
+    # Scale proportionally to match target brightness
+    lab_img[:, :, 0] = np.clip(lab_img[:, :, 0] * (target_Y / mean_L), 0, 255)
 
     # Replace a and b channels with chosen color's a and b
     lab_img[:, :, 1] = color_lab[1]
