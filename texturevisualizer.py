@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 import io
 
-st.title("Textured Paint Color Changer (RGB Input for Accurate Matching)")
+st.title("Textured Paint Color Changer (Improved Color Accuracy)")
 
 # Upload image
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
@@ -30,6 +30,12 @@ if uploaded_file is not None:
     # Convert chosen color to Lab
     color_bgr = np.uint8([[new_color_rgb[::-1]]])  # RGB to BGR for OpenCV
     color_lab = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2LAB)[0][0]
+
+    # Compute mean L of image
+    mean_L = np.mean(lab_img[:, :, 0])
+
+    # Adjust L channel toward target color's L while preserving texture contrast
+    lab_img[:, :, 0] = np.clip(lab_img[:, :, 0] * (color_lab[0] / mean_L), 0, 255)
 
     # Replace a and b channels with chosen color's a and b
     lab_img[:, :, 1] = color_lab[1]
