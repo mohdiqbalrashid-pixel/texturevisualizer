@@ -3,8 +3,9 @@ import cv2
 import numpy as np
 from PIL import Image
 import io
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.title("Textured Paint Color Changer (Reference Color + Accurate Transfer)")
+st.title("Textured Paint Color Changer (Click-to-Pick Reference Color)")
 
 # Upload image
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
@@ -14,8 +15,8 @@ if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
     img_array = np.array(image)
 
-    st.subheader("Original Image")
-    click_coords = st.image(img_array, caption="Click to select reference color", use_column_width=True)
+    st.subheader("Original Image - Click to select reference color")
+    coords = streamlit_image_coordinates(img_array)
 
     st.write("### Enter Target Color (RGB)")
     r = st.number_input("Red (0-255)", min_value=0, max_value=255, value=255)
@@ -23,11 +24,11 @@ if uploaded_file is not None:
     b = st.number_input("Blue (0-255)", min_value=0, max_value=255, value=0)
     new_color_rgb = (r, g, b)
 
-    # Get click coordinates for reference color
-    coords = st.session_state.get("clicked_coords", None)
+    # Determine reference color
     if coords:
-        x, y = coords
+        x, y = int(coords["x"]), int(coords["y"])
         ref_color = img_array[y, x]  # RGB from clicked pixel
+        st.info(f"Reference color selected: {ref_color}")
     else:
         st.warning("Click on the image to select a reference color.")
         ref_color = np.mean(img_array, axis=(0, 1))  # fallback: average color
