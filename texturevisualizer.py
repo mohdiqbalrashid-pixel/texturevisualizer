@@ -49,7 +49,7 @@ if uploaded_file is not None:
 
         img_lab_color = LabColor(avg_L, avg_a, avg_b)
         target_lab_color = LabColor(color_lab[0], color_lab[1], color_lab[2])
-        delta_e = delta_e_cie2000(img_lab_color, target_lab_color)
+        delta_e = float(delta_e_cie2000(img_lab_color, target_lab_color))  # FIXED
 
         if delta_e <= threshold:
             break
