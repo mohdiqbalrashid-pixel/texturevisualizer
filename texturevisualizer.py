@@ -5,7 +5,7 @@ from PIL import Image
 import io
 import math
 
-st.title("Textured Paint Color Changer (Custom Delta E Accurate Matching)")
+st.title("Textured Paint Color Changer (Per-Pixel Delta E Matching)")
 
 # --- Custom Delta E (CIEDE2000) Implementation ---
 def delta_e_ciede2000(lab1, lab2):
@@ -71,42 +71,26 @@ if uploaded_file is not None:
     new_color_rgb = (r, g, b)
 
     # Convert image to Lab
-    lab_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
+    lab_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB).astype(np.float32)
 
     # Convert target color to Lab
     color_bgr = np.uint8([[new_color_rgb[::-1]]])
     color_lab = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2LAB)[0][0]
 
-    # Initial recoloring
-    mean_L = np.mean(lab_img[:, :, 0])
-    target_Y = 0.299 * r + 0.587 * g + 0.114 * b
-    lab_img[:, :, 0] = np.clip(lab_img[:, :, 0] * (target_Y / mean_L), 0, 255)
-    lab_img[:, :, 1] = color_lab[1]
-    lab_img[:, :, 2] = color_lab[2]
+    # Per-pixel adjustment
+    target_lab = (color_lab[0], color_lab[1], color_lab[2])
+    adjustment_factor = 0.2  # Controls how aggressively pixels move toward target
 
-    # Convert to float for safe math
-    lab_img = lab_img.astype(np.float32)
+    for y in range(lab_img.shape[0]):
+        for x in range(lab_img.shape[1]):
+            pixel_lab = lab_img[y, x]
+            delta_e = delta_e_ciede2000(pixel_lab, target_lab)
+            if delta_e > 1.0:  # Only adjust if perceptual difference is noticeable
+                lab_img[y, x, 0] += (target_lab[0] - pixel_lab[0]) * adjustment_factor
+                lab_img[y, x, 1] += (target_lab[1] - pixel_lab[1]) * adjustment_factor
+                lab_img[y, x, 2] += (target_lab[2] - pixel_lab[2]) * adjustment_factor
 
-    # Iterative Delta E adjustment
-    max_iterations = 10
-    threshold = 2.0
-    for _ in range(max_iterations):
-        avg_L = np.mean(lab_img[:, :, 0])
-        avg_a = np.mean(lab_img[:, :, 1])
-        avg_b = np.mean(lab_img[:, :, 2])
-
-        delta_e = delta_e_ciede2000((avg_L, avg_a, avg_b), (color_lab[0], color_lab[1], color_lab[2]))
-        if delta_e <= threshold:
-            break
-
-        # Adjust channels slightly toward target
-        lab_img[:, :, 0] += (color_lab[0] - avg_L) * 0.1
-        lab_img[:, :, 1] += (color_lab[1] - avg_a) * 0.1
-        lab_img[:, :, 2] += (color_lab[2] - avg_b) * 0.1
-        lab_img = np.clip(lab_img, 0, 255)
-
-    # Convert back to uint8 for OpenCV
-    lab_img = lab_img.astype(np.uint8)
+    lab_img = np.clip(lab_img, 0, 255).astype(np.uint8)
 
     # Convert back to RGB
     recolored_img = cv2.cvtColor(lab_img, cv2.COLOR_LAB2RGB)
