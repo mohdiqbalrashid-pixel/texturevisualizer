@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 import io
 
-st.title("Textured Paint Color Changer (Accurate Color Matching)")
+st.title("Textured Paint Color Changer (RGB Input for Accurate Matching)")
 
 # Upload image
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
@@ -17,10 +17,12 @@ if uploaded_file is not None:
     st.subheader("Original Image")
     st.image(img_array, caption="Original", use_column_width=True)
 
-    # Color picker
-    new_color = st.color_picker("Pick a new color", "#FF0000")  # Default red
-    # Convert hex to RGB
-    new_color_rgb = tuple(int(new_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+    st.write("### Enter Target Color (RGB)")
+    r = st.number_input("Red (0-255)", min_value=0, max_value=255, value=255)
+    g = st.number_input("Green (0-255)", min_value=0, max_value=255, value=0)
+    b = st.number_input("Blue (0-255)", min_value=0, max_value=255, value=0)
+
+    new_color_rgb = (r, g, b)
 
     # Convert image to Lab color space
     lab_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
