@@ -84,6 +84,9 @@ if uploaded_file is not None:
     lab_img[:, :, 1] = color_lab[1]
     lab_img[:, :, 2] = color_lab[2]
 
+    # Convert to float for safe math
+    lab_img = lab_img.astype(np.float32)
+
     # Iterative Delta E adjustment
     max_iterations = 10
     threshold = 2.0
@@ -102,8 +105,11 @@ if uploaded_file is not None:
         lab_img[:, :, 2] += (color_lab[2] - avg_b) * 0.1
         lab_img = np.clip(lab_img, 0, 255)
 
+    # Convert back to uint8 for OpenCV
+    lab_img = lab_img.astype(np.uint8)
+
     # Convert back to RGB
-    recolored_img = cv2.cvtColor(lab_img.astype(np.uint8), cv2.COLOR_LAB2RGB)
+    recolored_img = cv2.cvtColor(lab_img, cv2.COLOR_LAB2RGB)
 
     st.subheader("Recolored Image")
     st.image(recolored_img, caption="Recolored", use_column_width=True)
