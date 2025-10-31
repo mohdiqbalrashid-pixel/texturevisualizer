@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 import io
 
-st.title("Textured Paint Color Changer")
+st.title("Textured Paint Color Changer (Improved Color Matching)")
 
 # Upload image
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
@@ -22,19 +22,20 @@ if uploaded_file is not None:
     # Convert hex to RGB
     new_color_rgb = tuple(int(new_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
 
-    # Convert image to HSV
-    hsv_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
+    # Convert to grayscale for texture
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    gray_3ch = cv2.merge([gray, gray, gray])
 
-    # Get hue of selected color
-    color_bgr = np.uint8([[new_color_rgb[::-1]]])  # Convert RGB to BGR for OpenCV
-    color_hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
-    new_hue = color_hsv[0][0][0]
+    # Create color layer
+    color_layer = np.full_like(gray_3ch, new_color_rgb)
 
-    # Replace hue while preserving texture
-    hsv_img[:, :, 0] = new_hue  # Replace hue
-    hsv_img[:, :, 1] = np.clip(hsv_img[:, :, 1] * 1.2, 0, 255)  # Slightly boost saturation
+    # Intensity slider
+    intensity = st.slider("Color Intensity", 0.0, 1.0, 0.8)
 
-    recolored_img = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2RGB)
+    # Blend using multiply (preserve texture)
+    recolored_img = (gray_3ch.astype(np.float32) / 255.0) * (np.array(color_layer, dtype=np.float32))
+    recolored_img = recolored_img * intensity + gray_3ch * (1 - intensity)
+    recolored_img = np.clip(recolored_img, 0, 255).astype(np.uint8)
 
     st.subheader("Recolored Image")
     st.image(recolored_img, caption="Recolored", use_column_width=True)
