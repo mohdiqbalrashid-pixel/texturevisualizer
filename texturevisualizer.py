@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 import io
 
-st.title("Textured Paint Color Changer (Optimized Per-Pixel Adjustment)")
+st.title("Textured Paint Color Changer (Improved Accuracy with Blend Control)")
 
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
 
@@ -21,6 +21,9 @@ if uploaded_file is not None:
     b = st.number_input("Blue (0-255)", min_value=0, max_value=255, value=0)
     new_color_rgb = (r, g, b)
 
+    # Blend ratio slider
+    blend_ratio = st.slider("Blend Strength", 0.0, 1.0, 0.4)
+
     # Convert image to Lab
     lab_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB).astype(np.float32)
 
@@ -28,24 +31,27 @@ if uploaded_file is not None:
     color_bgr = np.uint8([[new_color_rgb[::-1]]])
     color_lab = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2LAB)[0][0]
 
-    # Compute difference for all pixels
-    diff_L = color_lab[0] - lab_img[:, :, 0]
-    diff_a = color_lab[1] - lab_img[:, :, 1]
-    diff_b = color_lab[2] - lab_img[:, :, 2]
+    # Normalize Lab values for accurate math
+    L = lab_img[:, :, 0] / 255 * 100
+    a = lab_img[:, :, 1] - 128
+    b_ = lab_img[:, :, 2] - 128
 
-    # Approximate Delta E (Euclidean distance)
-    delta_e = np.sqrt(diff_L**2 + diff_a**2 + diff_b**2)
+    # Target normalized Lab
+    target_L = color_lab[0] / 255 * 100
+    target_a = color_lab[1] - 128
+    target_b = color_lab[2] - 128
 
-    # Normalize adjustment factor
-    adjustment_factor = 0.2
-    scale = adjustment_factor * (delta_e / (np.max(delta_e) + 1e-6))
+    # Apply proportional blending
+    L = L + (target_L - L) * blend_ratio
+    a = a + (target_a - a) * blend_ratio
+    b_ = b_ + (target_b - b_) * blend_ratio
 
-    # Apply proportional adjustment
-    lab_img[:, :, 0] += diff_L * scale
-    lab_img[:, :, 1] += diff_a * scale
-    lab_img[:, :, 2] += diff_b * scale
+    # Convert back to OpenCV Lab scale
+    lab_img[:, :, 0] = np.clip(L / 100 * 255, 0, 255)
+    lab_img[:, :, 1] = np.clip(a + 128, 0, 255)
+    lab_img[:, :, 2] = np.clip(b_ + 128, 0, 255)
 
-    lab_img = np.clip(lab_img, 0, 255).astype(np.uint8)
+    lab_img = lab_img.astype(np.uint8)
 
     # Convert back to RGB
     recolored_img = cv2.cvtColor(lab_img, cv2.COLOR_LAB2RGB)
