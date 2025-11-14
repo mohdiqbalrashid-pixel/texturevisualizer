@@ -4,11 +4,13 @@ import numpy as np
 from PIL import Image
 import io
 
-st.title("Textured Paint Color Changer (Color + Real Texture Boost)")
+st.title("Textured Paint Color Changer (Color + Texture Boost)")
 
+# Upload image
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
+    # Read image
     image = Image.open(uploaded_file).convert("RGB")
     img_array = np.array(image)
 
@@ -43,7 +45,7 @@ if uploaded_file is not None:
     # Convert back to RGB
     recolored_img = cv2.cvtColor(lab_img, cv2.COLOR_LAB2RGB).astype(np.float32) / 255.0
 
-    # Extract texture using CLAHE
+    # Enhance texture using CLAHE
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced_texture = clahe.apply(gray)
