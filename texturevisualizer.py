@@ -4,13 +4,11 @@ import numpy as np
 from PIL import Image
 import io
 
-st.title("Textured Paint Color Changer (Color + Texture Boost)")
+st.title("Textured Paint Color Changer (Color + Real Texture Boost)")
 
-# Upload image
 uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # Read image
     image = Image.open(uploaded_file).convert("RGB")
     img_array = np.array(image)
 
@@ -36,25 +34,27 @@ if uploaded_file is not None:
     color_lab = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2LAB)[0][0]
 
     # Apply color blending
-    lab_img[:, :, 0] = lab_img[:, :, 0] + (color_lab[0] - lab_img[:, :, 0]) * blend_ratio
-    lab_img[:, :, 1] = lab_img[:, :, 1] + (color_lab[1] - lab_img[:, :, 1]) * blend_ratio
-    lab_img[:, :, 2] = lab_img[:, :, 2] + (color_lab[2] - lab_img[:, :, 2]) * blend_ratio
+    lab_img[:, :, 0] += (color_lab[0] - lab_img[:, :, 0]) * blend_ratio
+    lab_img[:, :, 1] += (color_lab[1] - lab_img[:, :, 1]) * blend_ratio
+    lab_img[:, :, 2] += (color_lab[2] - lab_img[:, :, 2]) * blend_ratio
 
     lab_img = np.clip(lab_img, 0, 255).astype(np.uint8)
 
     # Convert back to RGB
-    recolored_img = cv2.cvtColor(lab_img, cv2.COLOR_LAB2RGB)
+    recolored_img = cv2.cvtColor(lab_img, cv2.COLOR_LAB2RGB).astype(np.float32) / 255.0
 
-    # Enhance texture using CLAHE
+    # Extract texture using CLAHE
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced_texture = clahe.apply(gray)
 
-    # Convert texture to 3-channel
-    texture_3ch = cv2.merge([enhanced_texture] * 3)
+    # Normalize texture to [0,1]
+    texture_norm = enhanced_texture.astype(np.float32) / 255.0
+    texture_norm = cv2.merge([texture_norm] * 3)
 
-    # Blend texture with recolored image
-    final_img = cv2.addWeighted(recolored_img, 1.0, texture_3ch, texture_strength, 0)
+    # Apply texture using multiply blend
+    final_img = recolored_img * (1 - texture_strength + texture_norm * texture_strength)
+    final_img = np.clip(final_img * 255, 0, 255).astype(np.uint8)
 
     st.subheader("Recolored Image with Enhanced Texture")
     st.image(final_img, caption="Recolored + Texture Boost", use_column_width=True)
