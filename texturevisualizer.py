@@ -1,3 +1,4 @@
+
 import streamlit as st
 import cv2
 import numpy as np
@@ -6,9 +7,28 @@ import io
 import traceback
 
 st.set_page_config(page_title="Textured Paint Color Changer", page_icon="🎨", layout="centered")
-st.title("🎨 Textured Paint Color Changer (Stable, High-Res)")
+st.title("🎨 Textured Paint Color Changer (White-Balanced, High-Res)")
 
 # ---------- Utilities ----------
+def gray_world_white_balance(img_rgb: np.ndarray) -> np.ndarray:
+    """
+    Gray-world white balance: scale each RGB channel by a gain so their means
+    converge toward a common gray target (overall mean). This neutralizes warm/cool casts.
+    """
+    img = img_rgb.astype(np.float32)
+    # Compute per-channel means (R, G, B)
+    means = img.mean(axis=(0, 1))  # shape (3,), RGB order
+    # Overall gray target = average of the three means
+    target = float(np.mean(means))
+    eps = 1e-6  # avoid division by zero
+
+    gains = target / (means + eps)  # shape (3,)
+    balanced = img * gains  # broadcast multiply per-channel
+
+    # Clip and return as uint8
+    balanced = np.clip(balanced, 0, 255).astype(np.uint8)
+    return balanced
+
 def rgb_to_lab_color(rgb_tuple):
     """
     Convert an (R,G,B) tuple (0-255) to a single LAB color using OpenCV.
@@ -20,7 +40,7 @@ def rgb_to_lab_color(rgb_tuple):
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)  # shape (1,1,3), dtype uint8
     return lab[0, 0]  # (L,a,b)
 
-def recolor_preserve_texture(img_rgb, target_rgb):
+def recolor_preserve_texture(img_rgb: np.ndarray, target_rgb) -> np.ndarray:
     """
     Recolor an RGB image by preserving the original L (lightness/texture) channel
     and replacing the a,b (chroma) channels with those of the target color in LAB space.
@@ -55,6 +75,12 @@ if uploaded_file is not None:
         st.subheader("Original Image")
         st.image(img_array, caption=f"Original ({img_array.shape[1]}×{img_array.shape[0]})", use_column_width=True)
 
+        # Automatic white balance correction (gray-world)
+        wb_img = gray_world_white_balance(img_array)
+
+        st.subheader("White-Balanced Preview")
+        st.image(wb_img, caption="Gray-world corrected (used for recoloring)", use_column_width=True)
+
         # RGB inputs (no sliders, exact values)
         st.write("### Enter Target Color (RGB)")
         c1, c2, c3 = st.columns(3)
@@ -69,8 +95,8 @@ if uploaded_file is not None:
         r, g, b = int(r), int(g), int(b)
         target_rgb = (r, g, b)
 
-        # Recolor with texture preserved
-        recolored_img = recolor_preserve_texture(img_array, target_rgb)
+        # Recolor with texture preserved on the white-balanced image
+        recolored_img = recolor_preserve_texture(wb_img, target_rgb)
 
         st.subheader("Recolored Image (High-Res, Texture Preserved)")
         st.image(recolored_img, caption=f"Recolored to RGB{target_rgb}", use_column_width=True)
@@ -99,8 +125,3 @@ if uploaded_file is not None:
         st.text_area("Traceback", value=traceback.format_exc(), height=240)
 else:
     st.info("Upload a photo of the textured paint surface to begin.")
-
-# Gray-world white balance on the input before recolor
-balanced = (img_array.astype(np.float32) / (img_array.mean(axis=(0,1)) + 1e-6)) * 128.0
-balanced = np.clip(balanced, 0, 255).astype(np.uint8)
-# Then recolor_preserve_texture(balanced, target_rgb)
