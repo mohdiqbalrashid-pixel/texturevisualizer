@@ -99,3 +99,8 @@ if uploaded_file is not None:
         st.text_area("Traceback", value=traceback.format_exc(), height=240)
 else:
     st.info("Upload a photo of the textured paint surface to begin.")
+
+# Gray-world white balance on the input before recolor
+balanced = (img_array.astype(np.float32) / (img_array.mean(axis=(0,1)) + 1e-6)) * 128.0
+balanced = np.clip(balanced, 0, 255).astype(np.uint8)
+# Then recolor_preserve_texture(balanced, target_rgb)
