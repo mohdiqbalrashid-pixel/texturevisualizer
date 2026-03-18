@@ -22,7 +22,7 @@ st.title("🎨 Textured Paint Recolor (Overall Impression Match + Batch Exports)
 # This corrects the systematic "slightly lighter" tendency across all colors.
 # If results still look a touch light, change to 0.92.
 # If results become slightly dark, change to 0.96.
-GLOBAL_BRIGHTNESS_BIAS = 0.20
+GLOBAL_BRIGHTNESS_BIAS = 0.92
 
 # Highlight-aware anchoring for textured surfaces
 ANCHOR_LOW_PCT = 25
