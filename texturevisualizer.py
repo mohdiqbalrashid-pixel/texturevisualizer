@@ -1,66 +1,51 @@
 import io
 import csv
 import zipfile
+import hashlib
 import traceback
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
 import numpy as np
 import cv2
 import streamlit as st
 from PIL import Image
 
-# --------------------------- Page setup ---------------------------
-
 st.set_page_config(page_title="Textured Paint Recolor", page_icon="🎨", layout="wide")
-st.title("🎨 Textured Paint Recolor (Accurate ‘Overall Impression’ + Batch Export Caps)")
+st.title("🎨 Textured Paint Recolor (Stable Batch + Size‑Capped Exports)")
 
-# ------------------------ Color pipeline (core) ------------------------
+# --------------------------- Core pipeline ---------------------------
 
 def srgb_to_linear(x: np.ndarray) -> np.ndarray:
-    """x in [0,1] float32"""
     x = np.clip(x, 0.0, 1.0)
     return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
 
 def linear_to_srgb(x: np.ndarray) -> np.ndarray:
-    """x in [0,1] float32"""
     x = np.clip(x, 0.0, 1.0)
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * (x ** (1 / 2.4)) - 0.055)
 
 def white_balance_preserve_luma(img_rgb: np.ndarray) -> np.ndarray:
-    """
-    Gray-world white balance but preserving overall luminance,
-    so WB doesn't make the entire image lighter/darker.
-    """
+    """Gray-world WB with luminance preserved (prevents global brightening)."""
     img = img_rgb.astype(np.float32)
-    means = img.mean(axis=(0, 1))  # [R,G,B]
+    means = img.mean(axis=(0, 1))
     target = float(np.mean(means))
     gains = target / (means + 1e-6)
-
     balanced = img * gains
 
-    # Preserve luma (Rec.709 proxy in gamma-encoded RGB)
     luma_before = (0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]).mean()
-    luma_after = (0.2126 * balanced[:, :, 0] + 0.7152 * balanced[:, :, 1] + 0.0722 * balanced[:, :, 2]).mean()
-
+    luma_after  = (0.2126 * balanced[:, :, 0] + 0.7152 * balanced[:, :, 1] + 0.0722 * balanced[:, :, 2]).mean()
     scale = luma_before / (luma_after + 1e-6)
+
     balanced = balanced * scale
     return np.clip(balanced, 0, 255).astype(np.uint8)
 
-def rgb_to_lab_color(rgb_tuple: Tuple[int, int, int]) -> np.ndarray:
-    """
-    Convert (R,G,B) -> LAB (OpenCV scale uint8 0..255).
-    Returns np.array([L,a,b], dtype=uint8).
-    """
-    r, g, b = [int(max(0, min(255, v))) for v in rgb_tuple]
+def rgb_to_lab_color(rgb: Tuple[int, int, int]) -> np.ndarray:
+    r, g, b = [int(max(0, min(255, v))) for v in rgb]
     bgr = np.array([[[b, g, r]]], dtype=np.uint8)
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    return lab[0, 0]
+    return lab[0, 0]  # uint8 L,a,b in 0..255
 
 def adjust_lightness_to_target(L: np.ndarray, target_L: float) -> np.ndarray:
-    """
-    Robustly remap lightness L (0..255) so median moves to target_L,
-    preserving texture contrast and avoiding clipping.
-    """
+    """Robust L remap: shift median to target while preserving contrast and avoiding clipping."""
     Lf = L.astype(np.float32)
     p10 = np.percentile(Lf, 10.0)
     p50 = np.percentile(Lf, 50.0)
@@ -71,7 +56,6 @@ def adjust_lightness_to_target(L: np.ndarray, target_L: float) -> np.ndarray:
 
     k_hi_max = (255.0 - target_L) / d_hi if d_hi > 0 else 1e9
     k_lo_max = (target_L - 0.0) / d_lo if d_lo > 0 else 1e9
-
     k_safe = max(0.0, min(k_hi_max, k_lo_max)) * 0.98
     k = min(1.0, k_safe)
 
@@ -79,22 +63,15 @@ def adjust_lightness_to_target(L: np.ndarray, target_L: float) -> np.ndarray:
     return np.clip(L_adj, 0, 255).astype(np.uint8)
 
 def recolor_preserve_texture_with_L_match(img_rgb: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
-    """
-    Recolor while preserving texture:
-      - Convert to LAB
-      - Soft chroma mix toward target a/b (reduces pink/green artifacts for near-neutrals)
-      - Remap L so overall lightness aligns to target L (helps light colors)
-      - Convert back to RGB
-    """
-    lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-    L = lab_img[:, :, 0]
-    orig_a = lab_img[:, :, 1].astype(np.float32)
-    orig_b = lab_img[:, :, 2].astype(np.float32)
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    L = lab[:, :, 0]
+    orig_a = lab[:, :, 1].astype(np.float32)
+    orig_b = lab[:, :, 2].astype(np.float32)
 
     tL, tA, tB = rgb_to_lab_color(target_rgb)
     tA, tB = float(tA), float(tB)
 
-    # Soft chroma mix factor based on "neutrality" in OpenCV LAB
+    # Soft chroma mix (reduces pink/green in near-neutrals)
     chroma_mag = float(np.hypot(tA - 128.0, tB - 128.0))
     if chroma_mag < 3.0:
         alpha = 0.55
@@ -109,22 +86,15 @@ def recolor_preserve_texture_with_L_match(img_rgb: np.ndarray, target_rgb: Tuple
     b_u8 = np.clip(b_final, 0, 255).astype(np.uint8)
 
     L_matched = adjust_lightness_to_target(L, float(tL))
-
     out_lab = cv2.merge([L_matched, a_u8, b_u8])
-    out_rgb = cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB)
-    return out_rgb
+    return cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB)
 
-def match_midtone_luminance_to_target(recolored_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
-    """
-    FINAL STEP for 'overall impression' matching:
-    Adjust overall brightness so midtone luminance of the image matches target color luminance.
-    - Works in linear RGB (correct photometric behavior)
-    - Uses robust midtone mask (10–90% luminance) so texture highlights/shadows don't dominate
-    """
-    img = recolored_u8.astype(np.float32) / 255.0
+def match_midtone_luminance_to_target(img_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
+    """Final overall-impression fix: match midtone luminance to target luminance."""
+    img = img_u8.astype(np.float32) / 255.0
     lin = srgb_to_linear(img)
-
     Y = 0.2126 * lin[:, :, 0] + 0.7152 * lin[:, :, 1] + 0.0722 * lin[:, :, 2]
+
     p10, p90 = np.percentile(Y, 10), np.percentile(Y, 90)
     mid = (Y >= p10) & (Y <= p90)
     if np.count_nonzero(mid) < 1000:
@@ -137,29 +107,20 @@ def match_midtone_luminance_to_target(recolored_u8: np.ndarray, target_rgb: Tupl
     tgt_Y = float(0.2126 * tgt_lin[0] + 0.7152 * tgt_lin[1] + 0.0722 * tgt_lin[2])
 
     s = tgt_Y / (med_Y + 1e-6)
-    s = float(np.clip(s, 0.70, 1.35))  # conservative clamp to keep realism
+    s = float(np.clip(s, 0.70, 1.35))
 
     lin_adj = np.clip(lin * s, 0.0, 1.0)
     out = linear_to_srgb(lin_adj)
     return (np.clip(out * 255.0, 0, 255)).astype(np.uint8)
 
 def process_color(img_rgb: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
-    """
-    Full pipeline for one color:
-      1) LAB recolor (texture preserved + L matched)
-      2) Midtone luminance match (overall impression)
-    """
     out = recolor_preserve_texture_with_L_match(img_rgb, target_rgb)
     out = match_midtone_luminance_to_target(out, target_rgb)
     return out
 
-# ------------------------ Export helpers (caps) ------------------------
+# --------------------------- Export helpers ---------------------------
 
 def sanitize_filename(name: str) -> str:
-    """
-    Keep letters, numbers, space, dash, underscore; replace others with underscore.
-    Collapse spaces to underscores. Avoid empty filenames.
-    """
     safe = []
     for ch in name:
         if ch.isalnum() or ch in (" ", "-", "_"):
@@ -177,70 +138,46 @@ def _jpeg_bytes(img: Image.Image, quality: int) -> bytes:
 
 def export_with_cap(pil_img: Image.Image, cap_bytes: int,
                     min_quality: int = 40, max_quality: int = 95,
-                    max_downscales: int = 5) -> Tuple[bytes, int, Tuple[int, int]]:
-    """
-    Ensure JPEG <= cap_bytes.
-    Strategy:
-      - binary search quality
-      - if still too big at min_quality, downscale slightly and retry (few times)
-    Returns (bytes, used_quality, (width,height)).
-    """
+                    max_downscales: int = 5) -> bytes:
+    """Return JPEG bytes <= cap_bytes (quality search + optional downscale)."""
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
 
-    def try_compress(img: Image.Image) -> Tuple[bytes, int]:
+    def try_compress(img: Image.Image) -> Optional[bytes]:
         lo, hi = min_quality, max_quality
-        best_bytes, best_q = None, None
+        best = None
         for _ in range(8):
             q = (lo + hi) // 2
             data = _jpeg_bytes(img, q)
             if len(data) <= cap_bytes:
-                best_bytes, best_q = data, q
+                best = data
                 lo = q + 1
             else:
                 hi = q - 1
-        if best_bytes is not None:
-            return best_bytes, best_q
-        return _jpeg_bytes(img, min_quality), min_quality
+        return best
 
     img = pil_img
-    attempt = 0
-    while True:
-        data, q = try_compress(img)
-        if len(data) <= cap_bytes:
-            return data, q, img.size
+    for _ in range(max_downscales + 1):
+        best = try_compress(img)
+        if best is not None:
+            return best
 
-        if attempt >= max_downscales:
-            return data, q, img.size
-
-        ratio = float(np.sqrt(cap_bytes / max(len(data), 1)) * 0.95)
-        ratio = float(max(min(ratio, 0.95), 0.60))
+        # Downscale and retry
+        # Estimate needed shrink ratio from last attempt at min_quality
+        data_min = _jpeg_bytes(img, min_quality)
+        ratio = float(np.sqrt(cap_bytes / max(len(data_min), 1)) * 0.95)
+        ratio = float(max(min(ratio, 0.92), 0.60))
         new_w = max(64, int(img.width * ratio))
         new_h = max(64, int(img.height * ratio))
         if (new_w, new_h) == img.size:
             new_w = max(64, img.width - 64)
             new_h = max(64, img.height - 64)
         img = img.resize((new_w, new_h), resample=Image.LANCZOS)
-        attempt += 1
 
-def ensure_unique_filenames(names: List[str]) -> List[str]:
-    """
-    Avoid collisions in ZIP (same color name repeated).
-    If duplicates exist, append _2, _3, ...
-    """
-    seen: Dict[str, int] = {}
-    out = []
-    for n in names:
-        base = n
-        if base not in seen:
-            seen[base] = 1
-            out.append(base)
-        else:
-            seen[base] += 1
-            out.append(f"{base}_{seen[base]}")
-    return out
+    # Fallback: return smallest we could make
+    return _jpeg_bytes(img, min_quality)
 
-# ------------------------ Batch input parsing ------------------------
+# --------------------------- Batch parsing ---------------------------
 
 def _safe_name_from_rgb(rgb: Tuple[int, int, int]) -> str:
     return f"{rgb[0]}-{rgb[1]}-{rgb[2]}"
@@ -260,15 +197,6 @@ def _parse_hex_token(tok: str) -> Optional[Tuple[int, int, int]]:
     return None
 
 def parse_rgb_lines(text: str) -> List[Tuple[str, Tuple[int, int, int]]]:
-    """
-    Accept lines like:
-      243,224,197
-      Sand Beige,243,224,197
-      #F3E0C5
-      F3E0C5,Sand Beige
-      Sand Beige #F3E0C5
-    Returns list of (name, (r,g,b))
-    """
     colors = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -298,7 +226,7 @@ def parse_rgb_lines(text: str) -> List[Tuple[str, Tuple[int, int, int]]]:
             except ValueError:
                 pass
 
-        # contains hex anywhere
+        # contains hex
         words = line.replace(",", " ").split()
         hex_rgb = None
         for w in words:
@@ -315,9 +243,6 @@ def parse_rgb_lines(text: str) -> List[Tuple[str, Tuple[int, int, int]]]:
     return colors
 
 def parse_csv_file(file) -> List[Tuple[str, Tuple[int, int, int]]]:
-    """
-    CSV expected columns: name,r,g,b OR r,g,b (header optional).
-    """
     txt = file.read().decode("utf-8", errors="ignore")
     file.seek(0)
     rows = []
@@ -325,7 +250,6 @@ def parse_csv_file(file) -> List[Tuple[str, Tuple[int, int, int]]]:
     for row in rdr:
         if not row:
             continue
-        # Skip header-ish
         low = [c.strip().lower() for c in row[:5]]
         if any(x in ("r", "g", "b") for x in low):
             continue
@@ -347,108 +271,98 @@ def parse_csv_file(file) -> List[Tuple[str, Tuple[int, int, int]]]:
                 pass
     return rows
 
-# ------------------------ State helpers ------------------------
+def fingerprint_image_bytes(uploaded_file) -> str:
+    """Stable key for caching based on file bytes hash (small read)."""
+    data = uploaded_file.getvalue()
+    return hashlib.sha1(data).hexdigest()
 
-def file_fingerprint(uploaded_file) -> str:
+# --------------------------- Cached ZIP builder ---------------------------
+
+@st.cache_data(show_spinner=False)
+def build_zip_for_cap(wb_img_u8: np.ndarray,
+                      colors: List[Tuple[str, Tuple[int, int, int]]],
+                      cap_mb: int,
+                      cache_salt: str) -> bytes:
     """
-    Create a stable fingerprint for session caching. We use name+size as a cheap key.
+    Build ZIP sequentially (memory-stable).
+    cache_salt is included to invalidate cache when inputs change.
     """
-    try:
-        return f"{uploaded_file.name}|{uploaded_file.size}"
-    except Exception:
-        return "unknown"
+    cap_bytes = cap_mb * 1024 * 1024
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, rgb in colors:
+            out = process_color(wb_img_u8, rgb)
+            data = export_with_cap(Image.fromarray(out), cap_bytes)
+            filename = f"{sanitize_filename(name)}.jpg"
+            zf.writestr(filename, data)
+    return zip_buf.getvalue()
 
-# ------------------------ UI ------------------------
+# --------------------------- Main UI ---------------------------
 
-uploaded_file = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
-
-if uploaded_file is None:
+uploaded = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"])
+if uploaded is None:
     st.info("Upload a photo of the textured wall to begin.")
     st.stop()
 
 try:
-    # Load original (full-res)
-    image = Image.open(uploaded_file).convert("RGB")
-    img = np.array(image)
-    fp = file_fingerprint(uploaded_file)
-
+    # Load original full-res image
+    img = np.array(Image.open(uploaded).convert("RGB"))
     st.subheader("Original Image")
     st.image(img, caption=f"Original ({img.shape[1]}×{img.shape[0]})", use_column_width=True)
 
-    # White-balance once (luma-preserving)
+    # White-balance once
     wb = white_balance_preserve_luma(img)
-    st.subheader("White-Balanced Preview")
-    st.image(wb, caption="White-balance with luminance preserved (used for recoloring)", use_column_width=True)
+    st.subheader("White‑Balanced Preview")
+    st.image(wb, caption="Used for recoloring (luminance preserved)", use_column_width=True)
 
     tab_single, tab_batch = st.tabs(["Single color", "Batch colors"])
 
-    # -------------------- Single color --------------------
+    # -------------------- Single --------------------
     with tab_single:
-        st.write("### Enter Target Color (RGB)")
+        st.write("### Single color")
         c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
         with c1:
-            r = st.number_input("Red (0–255)", 0, 255, 243, 1, key="s_r")
+            r = st.number_input("R", 0, 255, 243, 1)
         with c2:
-            g = st.number_input("Green (0–255)", 0, 255, 224, 1, key="s_g")
+            g = st.number_input("G", 0, 255, 224, 1)
         with c3:
-            b = st.number_input("Blue (0–255)", 0, 255, 197, 1, key="s_b")
+            b = st.number_input("B", 0, 255, 197, 1)
         with c4:
-            name_input = st.text_input("Color name (used as filename)", value="Sand Beige", key="s_name")
+            name = st.text_input("Color name (filename)", value="Sand Beige")
 
-        target_rgb = (int(r), int(g), int(b))
-        color_name = name_input.strip() or _safe_name_from_rgb(target_rgb)
-        safe_name = sanitize_filename(color_name)
+        rgb = (int(r), int(g), int(b))
+        safe_name = sanitize_filename(name.strip() or _safe_name_from_rgb(rgb))
 
-        if st.button("Recolor", type="primary", key="single_go"):
-            recolored = process_color(wb, target_rgb)
+        if st.button("Recolor", type="primary"):
+            out = process_color(wb, rgb)
+            st.image(out, caption=f"{name} • RGB{rgb}", use_column_width=True)
 
-            st.subheader("Recolored (High‑Res)")
-            st.image(recolored, caption=f"{color_name} • RGB{target_rgb}", use_column_width=True)
+            pil_out = Image.fromarray(out)
+            data5 = export_with_cap(pil_out, 5 * 1024 * 1024)
+            data10 = export_with_cap(pil_out, 10 * 1024 * 1024)
 
-            pil_out = Image.fromarray(recolored)
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button("Download ≤5MB (JPG)", data=data5,
+                                   file_name=f"{safe_name}.jpg", mime="image/jpeg")
+            with d2:
+                st.download_button("Download ≤10MB (JPG)", data=data10,
+                                   file_name=f"{safe_name}.jpg", mime="image/jpeg")
 
-            # capped exports
-            data5, q5, size5 = export_with_cap(pil_out, 5 * 1024 * 1024)
-            data10, q10, size10 = export_with_cap(pil_out, 10 * 1024 * 1024)
-
-            colA, colB = st.columns(2)
-            with colA:
-                st.download_button(
-                    "Download ≤5MB (JPG)",
-                    data=data5,
-                    file_name=f"{safe_name}.jpg",
-                    mime="image/jpeg",
-                    key="single_dl_5"
-                )
-                st.caption(f"Saved: {len(data5)/1024/1024:.2f} MB • q≈{q5} • {size5[0]}×{size5[1]}")
-            with colB:
-                st.download_button(
-                    "Download ≤10MB (JPG)",
-                    data=data10,
-                    file_name=f"{safe_name}.jpg",
-                    mime="image/jpeg",
-                    key="single_dl_10"
-                )
-                st.caption(f"Saved: {len(data10)/1024/1024:.2f} MB • q≈{q10} • {size10[0]}×{size10[1]}")
-
-    # -------------------- Batch colors --------------------
+    # -------------------- Batch --------------------
     with tab_batch:
-        st.write("### Paste colors or upload CSV")
-        st.caption(
-            "Formats per line: `243,224,197` • `Sand Beige,243,224,197` • `#F3E0C5` • `F3E0C5,Sand Beige` • `Sand Beige #F3E0C5`\n"
-            "CSV: `name,r,g,b` (header optional)."
-        )
+        st.write("### Batch colors (stable mode)")
+        st.caption("Paste: `Name,243,224,197` or `243,224,197` or `#F3E0C5, Name`. CSV also supported (name,r,g,b).")
 
         left, right = st.columns([2, 1])
         with left:
             txt = st.text_area(
-                "Paste RGB/Hex lines here",
-                value="Sand Beige,243,224,197\nWarm White,246,242,234\nMisty Green,213,224,220\n#F3E0C5, Cream",
-                height=160,
-                key="batch_text"
+                "Colors list",
+                value="Sand Beige,243,224,197\nWarm White,246,242,234\nMisty Green,213,224,220\nCream,#F3E0C5",
+                height=160
             )
         with right:
-            csv_file = st.file_uploader("...or upload CSV", type=["csv"], key="batch_csv")
+            csv_file = st.file_uploader("Upload CSV", type=["csv"])
 
         parsed: List[Tuple[str, Tuple[int, int, int]]] = []
         if txt.strip():
@@ -456,129 +370,100 @@ try:
         if csv_file is not None:
             parsed.extend(parse_csv_file(csv_file))
 
-        # Deduplicate by (name.lower(), rgb)
+        # Deduplicate on (sanitized name + rgb)
         seen = set()
-        batch: List[Tuple[str, Tuple[int, int, int]]] = []
-        for name, rgb in parsed:
-            nm = name.strip() or _safe_name_from_rgb(rgb)
-            key = (nm.lower(), rgb)
+        colors: List[Tuple[str, Tuple[int, int, int]]] = []
+        for nm, rgb in parsed:
+            nm = nm.strip() or _safe_name_from_rgb(rgb)
+            key = (sanitize_filename(nm).lower(), rgb)
             if key not in seen:
                 seen.add(key)
-                batch.append((nm, rgb))
+                colors.append((nm, rgb))
 
-        st.write(f"**Detected {len(batch)} color(s).**")
-        max_colors = 40
-        if len(batch) > max_colors:
-            st.warning(f"Limiting to first {max_colors} colors to keep Streamlit Cloud responsive.")
-            batch = batch[:max_colors]
+        st.write(f"**Detected {len(colors)} color(s).**")
 
-        # Cache results in session so downloads persist without rerun headaches
-        if "batch_cache" not in st.session_state:
-            st.session_state["batch_cache"] = {}
+        # Hard safety cap for Cloud stability
+        max_colors = 30
+        if len(colors) > max_colors:
+            st.warning(f"Limiting to first {max_colors} colors to prevent crashes on Streamlit Cloud.")
+            colors = colors[:max_colors]
 
-        cache_key = f"{fp}|{hash(txt)}|{csv_file.name if csv_file else 'no_csv'}|{len(batch)}"
-        cached = st.session_state["batch_cache"].get(cache_key)
-
-        if st.button("Generate all", type="primary", key="batch_go"):
-            results = []
-            prog = st.progress(0)
-
-            for i, (name, rgb) in enumerate(batch, start=1):
-                recol = process_color(wb, rgb)
-
-                # One preview per color (UI-only downscale)
-                prev = Image.fromarray(recol).copy()
-                prev.thumbnail((1200, 1200))
-
-                pil_out = Image.fromarray(recol)
-                data5, q5, size5 = export_with_cap(pil_out, 5 * 1024 * 1024)
-                data10, q10, size10 = export_with_cap(pil_out, 10 * 1024 * 1024)
-
-                results.append({
-                    "name": name,
-                    "safe_name": sanitize_filename(name),
-                    "rgb": rgb,
-                    "preview": np.array(prev),
-                    "data5": data5,
-                    "data10": data10,
-                })
-
-                prog.progress(i / len(batch))
-
-            # Ensure unique filenames (zip collision-safe)
-            safe_names = [r["safe_name"] for r in results]
-            unique = ensure_unique_filenames(safe_names)
-            for r, uniq in zip(results, unique):
-                r["safe_name_unique"] = uniq
-
-            st.session_state["batch_cache"][cache_key] = results
-            cached = results
-
-        if cached:
+        # --- Preview generation only (fast + low memory)
+        if st.button("Generate previews", type="primary"):
             st.subheader("Previews")
-            cols = st.columns(3)
+            cols_ui = st.columns(3)
 
-            for idx, item in enumerate(cached):
-                with cols[idx % 3]:
-                    st.image(
-                        item["preview"],
-                        caption=f"{item['name']} • RGB{item['rgb']}",
-                        use_column_width=True
-                    )
-                    b1, b2 = st.columns(2)
-                    with b1:
-                        st.download_button(
-                            "≤5MB JPG",
-                            data=item["data5"],
-                            file_name=f"{item['safe_name_unique']}.jpg",
-                            mime="image/jpeg",
-                            key=f"b5_{idx}"
-                        )
-                    with b2:
-                        st.download_button(
-                            "≤10MB JPG",
-                            data=item["data10"],
-                            file_name=f"{item['safe_name_unique']}.jpg",
-                            mime="image/jpeg",
-                            key=f"b10_{idx}"
-                        )
+            # Use smaller preview processing to keep UI snappy (doesn't affect exports)
+            preview_base = wb.copy()
+            max_preview_dim = 900
+            h, w = preview_base.shape[:2]
+            if max(h, w) > max_preview_dim:
+                scale = max_preview_dim / max(h, w)
+                preview_base = cv2.resize(preview_base, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-            # ZIP downloads (both caps)
-            st.subheader("Download all")
-            zip5 = io.BytesIO()
-            with zipfile.ZipFile(zip5, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for item in cached:
-                    zf.writestr(f"{item['safe_name_unique']}.jpg", item["data5"])
+            for idx, (nm, rgb) in enumerate(colors):
+                prev = process_color(preview_base, rgb)
+                with cols_ui[idx % 3]:
+                    st.image(prev, caption=f"{nm} • RGB{rgb}", use_column_width=True)
 
-            zip10 = io.BytesIO()
-            with zipfile.ZipFile(zip10, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for item in cached:
-                    zf.writestr(f"{item['safe_name_unique']}.jpg", item["data10"])
+            st.session_state["last_colors"] = colors  # store names+rgbs only
 
-            zc1, zc2 = st.columns(2)
-            with zc1:
-                st.download_button(
-                    "Download ALL ≤5MB (ZIP)",
-                    data=zip5.getvalue(),
-                    file_name="recolored_batch_5MB_max.zip",
-                    mime="application/zip",
-                    type="primary",
-                    key="zip5"
-                )
-            with zc2:
-                st.download_button(
-                    "Download ALL ≤10MB (ZIP)",
-                    data=zip10.getvalue(),
-                    file_name="recolored_batch_10MB_max.zip",
-                    mime="application/zip",
-                    type="primary",
-                    key="zip10"
-                )
+        # --- Export ONE selected color (on demand)
+        st.divider()
+        st.write("### Download one (on-demand, avoids crashing)")
+        colors_for_select = st.session_state.get("last_colors", colors)
+        if colors_for_select:
+            options = [nm for nm, _ in colors_for_select]
+            sel = st.selectbox("Select color to export", options)
+            sel_rgb = dict(colors_for_select)[sel]
+
+            cA, cB = st.columns(2)
+            with cA:
+                if st.button("Prepare ≤5MB JPG"):
+                    out = process_color(wb, sel_rgb)
+                    data = export_with_cap(Image.fromarray(out), 5 * 1024 * 1024)
+                    st.download_button("Download ≤5MB", data=data,
+                                       file_name=f"{sanitize_filename(sel)}.jpg", mime="image/jpeg",
+                                       type="primary")
+            with cB:
+                if st.button("Prepare ≤10MB JPG"):
+                    out = process_color(wb, sel_rgb)
+                    data = export_with_cap(Image.fromarray(out), 10 * 1024 * 1024)
+                    st.download_button("Download ≤10MB", data=data,
+                                       file_name=f"{sanitize_filename(sel)}.jpg", mime="image/jpeg",
+                                       type="primary")
+
+        # --- ZIP export (build one at a time, cached)
+        st.divider()
+        st.write("### Download ALL (ZIP)")
+        st.caption("Builds sequentially and caches results. Choose only one cap at a time to keep memory stable.")
+
+        img_hash = fingerprint_image_bytes(uploaded)
+        salt = f"{img_hash}|{hash(str(colors))}"
+
+        z1, z2 = st.columns(2)
+        with z1:
+            if st.button("Build ZIP ≤5MB", type="primary"):
+                with st.spinner("Building ZIP ≤5MB..."):
+                    zip_bytes = build_zip_for_cap(wb, colors, cap_mb=5, cache_salt=salt)
+                st.download_button("Download ZIP ≤5MB", data=zip_bytes,
+                                   file_name="recolored_batch_5MB_max.zip",
+                                   mime="application/zip",
+                                   type="primary")
+        with z2:
+            if st.button("Build ZIP ≤10MB", type="primary"):
+                with st.spinner("Building ZIP ≤10MB..."):
+                    zip_bytes = build_zip_for_cap(wb, colors, cap_mb=10, cache_salt=salt)
+                st.download_button("Download ZIP ≤10MB", data=zip_bytes,
+                                   file_name="recolored_batch_10MB_max.zip",
+                                   mime="application/zip",
+                                   type="application/zip",
+                                   )
 
     with st.expander("Debug info"):
-        st.write({"shape": img.shape, "dtype": str(img.dtype), "file": uploaded_file.name})
+        st.write({"shape": img.shape, "dtype": str(img.dtype), "file": uploaded.name})
 
 except Exception as e:
-    st.error("There was an error while running the app.")
+    st.error("The app hit an error.")
     st.exception(e)
     st.text_area("Traceback", value=traceback.format_exc(), height=260)
