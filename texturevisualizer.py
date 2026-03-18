@@ -458,3 +458,127 @@ try:
 
         # Deduplicate by (name.lower(), rgb)
         seen = set()
+        batch: List[Tuple[str, Tuple[int, int, int]]] = []
+        for name, rgb in parsed:
+            nm = name.strip() or _safe_name_from_rgb(rgb)
+            key = (nm.lower(), rgb)
+            if key not in seen:
+                seen.add(key)
+                batch.append((nm, rgb))
+
+        st.write(f"**Detected {len(batch)} color(s).**")
+        max_colors = 40
+        if len(batch) > max_colors:
+            st.warning(f"Limiting to first {max_colors} colors to keep Streamlit Cloud responsive.")
+            batch = batch[:max_colors]
+
+        # Cache results in session so downloads persist without rerun headaches
+        if "batch_cache" not in st.session_state:
+            st.session_state["batch_cache"] = {}
+
+        cache_key = f"{fp}|{hash(txt)}|{csv_file.name if csv_file else 'no_csv'}|{len(batch)}"
+        cached = st.session_state["batch_cache"].get(cache_key)
+
+        if st.button("Generate all", type="primary", key="batch_go"):
+            results = []
+            prog = st.progress(0)
+
+            for i, (name, rgb) in enumerate(batch, start=1):
+                recol = process_color(wb, rgb)
+
+                # One preview per color (UI-only downscale)
+                prev = Image.fromarray(recol).copy()
+                prev.thumbnail((1200, 1200))
+
+                pil_out = Image.fromarray(recol)
+                data5, q5, size5 = export_with_cap(pil_out, 5 * 1024 * 1024)
+                data10, q10, size10 = export_with_cap(pil_out, 10 * 1024 * 1024)
+
+                results.append({
+                    "name": name,
+                    "safe_name": sanitize_filename(name),
+                    "rgb": rgb,
+                    "preview": np.array(prev),
+                    "data5": data5,
+                    "data10": data10,
+                })
+
+                prog.progress(i / len(batch))
+
+            # Ensure unique filenames (zip collision-safe)
+            safe_names = [r["safe_name"] for r in results]
+            unique = ensure_unique_filenames(safe_names)
+            for r, uniq in zip(results, unique):
+                r["safe_name_unique"] = uniq
+
+            st.session_state["batch_cache"][cache_key] = results
+            cached = results
+
+        if cached:
+            st.subheader("Previews")
+            cols = st.columns(3)
+
+            for idx, item in enumerate(cached):
+                with cols[idx % 3]:
+                    st.image(
+                        item["preview"],
+                        caption=f"{item['name']} • RGB{item['rgb']}",
+                        use_column_width=True
+                    )
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        st.download_button(
+                            "≤5MB JPG",
+                            data=item["data5"],
+                            file_name=f"{item['safe_name_unique']}.jpg",
+                            mime="image/jpeg",
+                            key=f"b5_{idx}"
+                        )
+                    with b2:
+                        st.download_button(
+                            "≤10MB JPG",
+                            data=item["data10"],
+                            file_name=f"{item['safe_name_unique']}.jpg",
+                            mime="image/jpeg",
+                            key=f"b10_{idx}"
+                        )
+
+            # ZIP downloads (both caps)
+            st.subheader("Download all")
+            zip5 = io.BytesIO()
+            with zipfile.ZipFile(zip5, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for item in cached:
+                    zf.writestr(f"{item['safe_name_unique']}.jpg", item["data5"])
+
+            zip10 = io.BytesIO()
+            with zipfile.ZipFile(zip10, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for item in cached:
+                    zf.writestr(f"{item['safe_name_unique']}.jpg", item["data10"])
+
+            zc1, zc2 = st.columns(2)
+            with zc1:
+                st.download_button(
+                    "Download ALL ≤5MB (ZIP)",
+                    data=zip5.getvalue(),
+                    file_name="recolored_batch_5MB_max.zip",
+                    mime="application/zip",
+                    type="primary",
+                    key="zip5"
+                )
+            with zc2:
+                st.download_button(
+                    "Download ALL ≤10MB (ZIP)",
+                    data=zip10.getvalue(),
+                    file_name="recolored_batch_10MB_max.zip",
+                    mime="application/zip",
+                    type="primary",
+                    key="zip10"
+                )
+
+    with st.expander("Debug info"):
+        st.write({"shape": img.shape, "dtype": str(img.dtype), "file": uploaded_file.name})
+
+except Exception as e:
+    st.error("There was an error while running the app.")
+    st.exception(e)
+    st.text_area("Traceback", value=traceback.format_exc(), height=260)
