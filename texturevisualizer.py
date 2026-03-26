@@ -14,16 +14,16 @@ from PIL import Image
 # Page setup
 # =========================
 st.set_page_config(page_title="Textured Paint Recolor", page_icon="🎨", layout="wide")
-st.title("🎨 Textured Paint Recolor (Robust Upload + Mean RGB Debug + Batch Exports)")
+st.title("🎨 Textured Paint Recolor (Reference-Calibrated Targets + Batch Exports)")
 
 # =========================
 # Constants (no sliders)
 # =========================
-# Fix systematic "slightly lighter" across all colors.
-# If still light -> 0.92. If slightly dark -> 0.96.
-GLOBAL_BRIGHTNESS_BIAS = 0.94
+# Keep this as a mild “last mile” correction.
+# If calibration is enabled, we automatically set this to 1.0 (no extra bias).
+BASE_GLOBAL_BRIGHTNESS_BIAS = 0.94
 
-# Highlight-aware "overall impression" anchoring
+# Highlight-aware “overall impression” anchoring
 ANCHOR_LOW_PCT = 25
 ANCHOR_HIGH_PCT = 85
 ANCHOR_REF_PCT = 70
@@ -35,13 +35,9 @@ MAX_COLORS_ZIP_10MB = 18
 MAX_ZIP_MB = 180  # rough safety limit for ZIP size to avoid browser/cloud issues
 
 # =========================
-# Robust image loading + debug
+# Helpers: robust upload load
 # =========================
 def load_uploaded_image_bytes(uploaded_file) -> Tuple[bytes, np.ndarray]:
-    """
-    Always load from raw bytes to avoid any file-pointer/caching confusion.
-    Returns (bytes, img_rgb_uint8).
-    """
     img_bytes = uploaded_file.getvalue()
     img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
     return img_bytes, img
@@ -49,22 +45,83 @@ def load_uploaded_image_bytes(uploaded_file) -> Tuple[bytes, np.ndarray]:
 def sha1_hex(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
-def mean_rgb(img_rgb: np.ndarray) -> np.ndarray:
-    return img_rgb.reshape(-1, 3).mean(axis=0)
+# =========================
+# Color space helpers
+# =========================
+def srgb_to_linear01(x01: np.ndarray) -> np.ndarray:
+    x01 = np.clip(x01, 0.0, 1.0)
+    return np.where(x01 <= 0.04045, x01 / 12.92, ((x01 + 0.055) / 1.055) ** 2.4)
+
+def linear_to_srgb01(x01: np.ndarray) -> np.ndarray:
+    x01 = np.clip(x01, 0.0, 1.0)
+    return np.where(x01 <= 0.0031308, x01 * 12.92, 1.055 * (x01 ** (1 / 2.4)) - 0.055)
 
 # =========================
-# White balance (kept internal; not shown in UI)
+# Observed RGB estimation (whole image, robust)
 # =========================
-def compute_grayworld_gains(img_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    img = img_rgb.astype(np.float32)
-    means = img.mean(axis=(0, 1))  # [R,G,B]
-    target = float(np.mean(means))
-    gains = target / (means + 1e-6)
-    return means, gains
+def mean_rgb(img_u8: np.ndarray) -> np.ndarray:
+    return img_u8.reshape(-1, 3).mean(axis=0)
 
+def robust_observed_rgb_midtone_median(img_u8: np.ndarray) -> np.ndarray:
+    """
+    Compute observed RGB from the whole image robustly:
+    - build luma in sRGB
+    - keep midtones (20–80 percentile)
+    - return median RGB over those pixels
+    """
+    img = img_u8.astype(np.float32) / 255.0
+    Y = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
+    p20, p80 = np.percentile(Y, 20), np.percentile(Y, 80)
+    mask = (Y >= p20) & (Y <= p80)
+    if np.count_nonzero(mask) < 1000:
+        mask = np.ones_like(Y, dtype=bool)
+
+    med = np.array([
+        np.median(img[:, :, 0][mask]),
+        np.median(img[:, :, 1][mask]),
+        np.median(img[:, :, 2][mask]),
+    ], dtype=np.float32)
+
+    return med * 255.0
+
+# =========================
+# Reference calibration (your idea)
+# =========================
+def compute_reference_gains(obs_rgb_u8: np.ndarray, true_rgb_u8: Tuple[int, int, int]) -> np.ndarray:
+    """
+    Compute per-channel gains in LINEAR RGB:
+      gain = true / observed
+    Clamped to prevent insane corrections if something is off.
+    Returns gains_lin (3,) float32.
+    """
+    obs01 = srgb_to_linear01(np.array(obs_rgb_u8, dtype=np.float32) / 255.0)
+    tru01 = srgb_to_linear01(np.array(true_rgb_u8, dtype=np.float32) / 255.0)
+
+    gains = tru01 / np.maximum(obs01, 1e-6)
+
+    # Safety clamp: calibration shouldn’t be extreme for a real wall photo
+    gains = np.clip(gains, 0.5, 2.0).astype(np.float32)
+    return gains
+
+def apply_gains_to_target_rgb(target_rgb: Tuple[int, int, int], gains_lin: np.ndarray) -> Tuple[int, int, int]:
+    """
+    Apply calibration gains to the requested target color:
+      target_corrected = target * gains
+    Done in linear RGB, returned as sRGB uint8.
+    """
+    t01 = np.array(target_rgb, dtype=np.float32) / 255.0
+    t_lin = srgb_to_linear01(t01)
+    t_lin_corr = np.clip(t_lin * gains_lin, 0.0, 1.0)
+    t_corr = linear_to_srgb01(t_lin_corr)
+    t_u8 = np.clip(t_corr * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return (int(t_u8[0]), int(t_u8[1]), int(t_u8[2]))
+
+# =========================
+# White balance (internal)
+# =========================
 def white_balance_preserve_luma(img_rgb: np.ndarray) -> np.ndarray:
     """
-    Gray-world WB but preserve overall luminance so the image doesn't get globally brighter.
+    Gray-world WB but preserve overall luminance so WB doesn't brighten/darken globally.
     """
     img = img_rgb.astype(np.float32)
     means = img.mean(axis=(0, 1))
@@ -81,18 +138,15 @@ def white_balance_preserve_luma(img_rgb: np.ndarray) -> np.ndarray:
     return np.clip(balanced, 0, 255).astype(np.uint8)
 
 # =========================
-# Recolor pipeline (texture preserved + overall impression match)
+# Recolor pipeline
 # =========================
 def rgb_to_lab_color(rgb: Tuple[int, int, int]) -> np.ndarray:
     r, g, b = [int(max(0, min(255, v))) for v in rgb]
     bgr = np.array([[[b, g, r]]], dtype=np.uint8)
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    return lab[0, 0]  # uint8 L,a,b (0..255)
+    return lab[0, 0]  # uint8 L,a,b
 
 def adjust_lightness_to_target(L: np.ndarray, target_L: float) -> np.ndarray:
-    """
-    Robust L remap: shift median to target_L while preserving contrast and avoiding clipping.
-    """
     Lf = L.astype(np.float32)
     p10 = np.percentile(Lf, 10.0)
     p50 = np.percentile(Lf, 50.0)
@@ -125,7 +179,6 @@ def recolor_preserve_texture_with_L_match(img_rgb: np.ndarray, target_rgb: Tuple
     tL, tA, tB = rgb_to_lab_color(target_rgb)
     tA, tB = float(tA), float(tB)
 
-    # Soft chroma mix (avoid artifacts on near neutrals)
     chroma_mag = float(np.hypot(tA - 128.0, tB - 128.0))
     if chroma_mag < 3.0:
         alpha = 0.55
@@ -143,14 +196,13 @@ def recolor_preserve_texture_with_L_match(img_rgb: np.ndarray, target_rgb: Tuple
     out_lab = cv2.merge([L_matched, a_u8, b_u8])
     return cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB)
 
-def match_overall_impression_to_target(recolored_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
+def match_overall_impression_to_target(recolored_u8: np.ndarray, target_rgb: Tuple[int, int, int], brightness_bias: float) -> np.ndarray:
     """
-    Perceptual (sRGB) highlight-aware brightness anchoring + global bias.
-    Fixes the "all colors slightly lighter" issue.
+    Perceptual highlight-aware brightness anchoring + global bias.
+    For reference-calibrated targets, we typically set bias=1.0.
     """
     img = recolored_u8.astype(np.float32) / 255.0  # sRGB
 
-    # sRGB luma proxy
     Y = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
 
     p_lo, p_hi = np.percentile(Y, ANCHOR_LOW_PCT), np.percentile(Y, ANCHOR_HIGH_PCT)
@@ -163,16 +215,33 @@ def match_overall_impression_to_target(recolored_u8: np.ndarray, target_rgb: Tup
     tr, tg, tb = [v / 255.0 for v in target_rgb]
     y_tgt = float(0.2126 * tr + 0.7152 * tg + 0.0722 * tb)
 
-    s = (y_tgt / (y_ref + 1e-6)) * GLOBAL_BRIGHTNESS_BIAS
+    s = (y_tgt / (y_ref + 1e-6)) * float(brightness_bias)
     s = float(np.clip(s, 0.70, 1.20))
 
     out = np.clip(img * s, 0.0, 1.0)
     return (out * 255.0 + 0.5).astype(np.uint8)
 
-def process_color(img_rgb: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
-    out = recolor_preserve_texture_with_L_match(img_rgb, target_rgb)
-    out = match_overall_impression_to_target(out, target_rgb)
-    return out
+def process_color(img_rgb: np.ndarray,
+                  requested_target_rgb: Tuple[int, int, int],
+                  gains_lin: Optional[np.ndarray],
+                  use_calibration: bool) -> Tuple[np.ndarray, Tuple[int, int, int]]:
+    """
+    Full pipeline:
+      - optionally correct the requested target using reference gains
+      - recolor in LAB
+      - overall impression anchor
+    Returns (output_image, used_target_rgb)
+    """
+    if use_calibration and gains_lin is not None:
+        used_target_rgb = apply_gains_to_target_rgb(requested_target_rgb, gains_lin)
+        bias = 1.0  # calibration already handles systemic bias
+    else:
+        used_target_rgb = requested_target_rgb
+        bias = BASE_GLOBAL_BRIGHTNESS_BIAS
+
+    out = recolor_preserve_texture_with_L_match(img_rgb, used_target_rgb)
+    out = match_overall_impression_to_target(out, used_target_rgb, bias)
+    return out, used_target_rgb
 
 # =========================
 # Export helpers (JPEG caps)
@@ -196,9 +265,6 @@ def _jpeg_bytes(img: Image.Image, quality: int) -> bytes:
 def export_with_cap(pil_img: Image.Image, cap_bytes: int,
                     min_quality: int = 40, max_quality: int = 95,
                     max_downscales: int = 5) -> bytes:
-    """
-    Export JPEG bytes <= cap_bytes. Binary search quality, then downscale if needed.
-    """
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
 
@@ -285,7 +351,7 @@ def parse_rgb_lines(text: str) -> List[Tuple[str, Tuple[int, int, int]]]:
             except ValueError:
                 pass
 
-        # hex anywhere, with optional name
+        # hex anywhere
         words = line.replace(",", " ").split()
         hex_rgb = None
         for w in words:
@@ -309,7 +375,6 @@ def parse_csv_file(file) -> List[Tuple[str, Tuple[int, int, int]]]:
     for row in rdr:
         if not row:
             continue
-
         low = [c.strip().lower() for c in row[:5]]
         if any(x in ("r", "g", "b") for x in low):
             continue
@@ -339,19 +404,22 @@ def build_zip_for_cap(
     img_bytes: bytes,
     colors: List[Tuple[str, Tuple[int, int, int]]],
     cap_mb: int,
-    cache_salt: str
+    cache_salt: str,
+    use_calibration: bool,
+    gains_lin_tuple: Optional[Tuple[float, float, float]]
 ) -> bytes:
-    """
-    Cached ZIP builder. We pass img_bytes (not numpy arrays) so cache hashing is stable.
-    """
     base_img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
     wb_img = white_balance_preserve_luma(base_img)
+
+    gains_lin = None
+    if use_calibration and gains_lin_tuple is not None:
+        gains_lin = np.array(gains_lin_tuple, dtype=np.float32)
 
     cap_bytes = cap_mb * 1024 * 1024
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name, rgb in colors:
-            out = process_color(wb_img, rgb)
+            out, used_rgb = process_color(wb_img, rgb, gains_lin, use_calibration)
             data = export_with_cap(Image.fromarray(out), cap_bytes)
             zf.writestr(f"{sanitize_filename(name)}.jpg", data)
 
@@ -360,41 +428,54 @@ def build_zip_for_cap(
 # =========================
 # UI
 # =========================
-uploaded = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"], key="uploader_v3")
+uploaded = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"], key="uploader_calib")
 
 if uploaded is None:
     st.info("Upload a photo to begin.")
     st.stop()
 
 try:
-    # Always load from bytes
     img_bytes, img = load_uploaded_image_bytes(uploaded)
 
-    # Debug section: identity + pixel proofs + mean RGB
-    with st.expander("Debug: upload identity + Mean RGB"):
-        st.write("Filename:", uploaded.name)
-        st.write("Size (bytes):", uploaded.size)
-        st.write("SHA1 (content hash):", sha1_hex(img_bytes))
+    # Internal WB (not shown)
+    wb_img = white_balance_preserve_luma(img)
 
-        st.write("Image shape:", img.shape, "dtype:", str(img.dtype))
-        st.write("Top-left pixel RGB:", img[0, 0].tolist())
-        st.write("Center pixel RGB:", img[img.shape[0]//2, img.shape[1]//2].tolist())
+    # ---- Calibration inputs ----
+    st.subheader("Reference calibration (your measured RGB)")
+    c0, c1, c2, c3 = st.columns([1.2, 1, 1, 1])
+    with c0:
+        use_cal = st.checkbox("Use reference calibration", value=True)
+    with c1:
+        ref_r = st.number_input("Reference TRUE R", 0, 255, 213, 1)
+    with c2:
+        ref_g = st.number_input("Reference TRUE G", 0, 255, 224, 1)
+    with c3:
+        ref_b = st.number_input("Reference TRUE B", 0, 255, 220, 1)
 
-        m = mean_rgb(img)
-        st.write("Mean RGB (full precision):", m)
-        st.write("Mean RGB (6 dp):", [float(f"{x:.6f}") for x in m])
+    ref_true_rgb = (int(ref_r), int(ref_g), int(ref_b))
 
-        means, gains = compute_grayworld_gains(img)
-        st.write("WB Mean RGB (R,G,B):", means)
-        st.write("WB Gains (R,G,B) full:", gains)
-        st.write("WB Gains (6 dp):", [float(f"{g:.6f}") for g in gains])
+    # Observed RGB from whole image (mean + robust median)
+    obs_mean = mean_rgb(wb_img)
+    obs_med = robust_observed_rgb_midtone_median(wb_img)
 
-    # Show original (only)
+    gains_lin = None
+    gains_lin_tuple = None
+    if use_cal:
+        gains_lin = compute_reference_gains(obs_med, ref_true_rgb)
+        gains_lin_tuple = (float(gains_lin[0]), float(gains_lin[1]), float(gains_lin[2]))
+
+    # Show calibration details
+    with st.expander("Calibration debug (observed vs true)"):
+        st.write("File:", uploaded.name)
+        st.write("SHA1:", sha1_hex(img_bytes))
+        st.write("Observed Mean RGB (WB image):", [float(f"{x:.3f}") for x in obs_mean])
+        st.write("Observed Midtone Median RGB (WB image):", [float(f"{x:.3f}") for x in obs_med])
+        st.write("Reference TRUE RGB (input):", ref_true_rgb)
+        if gains_lin is not None:
+            st.write("Computed linear gains (R,G,B):", [float(f"{g:.6f}") for g in gains_lin])
+
     st.subheader("Original Image")
     st.image(img, caption=f"{uploaded.name} • {img.shape[1]}×{img.shape[0]}", use_column_width=True)
-
-    # WB internally only (not shown)
-    wb = white_balance_preserve_luma(img)
 
     tab_single, tab_batch = st.tabs(["Single color", "Batch colors"])
 
@@ -411,12 +492,15 @@ try:
         with c4:
             name = st.text_input("Color name (filename)", value="Sand Beige", key="sname")
 
-        rgb = (int(r), int(g), int(b))
-        safe_name = sanitize_filename(name.strip() or _safe_name_from_rgb(rgb))
+        requested_rgb = (int(r), int(g), int(b))
+        safe_name = sanitize_filename(name.strip() or _safe_name_from_rgb(requested_rgb))
 
         if st.button("Recolor", type="primary", key="single_go"):
-            out = process_color(wb, rgb)
-            st.image(out, caption=f"{name} • RGB{rgb}", use_column_width=True)
+            out, used_rgb = process_color(wb_img, requested_rgb, gains_lin, use_cal)
+
+            # show what we actually used (after calibration)
+            st.caption(f"Requested RGB: {requested_rgb}  →  Used RGB (after calibration): {used_rgb}")
+            st.image(out, caption=f"{name} • RGB{requested_rgb}", use_column_width=True)
 
             data5 = export_with_cap(Image.fromarray(out), 5 * 1024 * 1024)
             data10 = export_with_cap(Image.fromarray(out), 10 * 1024 * 1024)
@@ -451,7 +535,7 @@ try:
         if csv_file is not None:
             parsed.extend(parse_csv_file(csv_file))
 
-        # Deduplicate
+        # Deduplicate (sanitized name + rgb)
         seen = set()
         colors: List[Tuple[str, Tuple[int, int, int]]] = []
         for nm, rgb in parsed:
@@ -463,12 +547,12 @@ try:
 
         st.write(f"**Detected {len(colors)} color(s).**")
 
-        # Preview generation (safe)
+        # ---- Previews only (safe) ----
         if st.button("Generate previews", type="primary", key="prev_go"):
             st.subheader("Previews")
             cols_ui = st.columns(3)
 
-            preview_base = wb.copy()
+            preview_base = wb_img.copy()
             max_preview_dim = 900
             h, w = preview_base.shape[:2]
             if max(h, w) > max_preview_dim:
@@ -476,13 +560,13 @@ try:
                 preview_base = cv2.resize(preview_base, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
             for idx, (nm, rgb) in enumerate(colors[:MAX_COLORS_PREVIEW]):
-                prev = process_color(preview_base, rgb)
+                prev, used_rgb = process_color(preview_base, rgb, gains_lin, use_cal)
                 with cols_ui[idx % 3]:
                     st.image(prev, caption=f"{nm} • RGB{rgb}", use_column_width=True)
 
             st.session_state["last_colors"] = colors
 
-        # Download one (on-demand)
+        # ---- Download ONE (on-demand) ----
         st.divider()
         st.write("### Download one (on-demand)")
         colors_for_select = st.session_state.get("last_colors", colors)
@@ -495,26 +579,26 @@ try:
             b1, b2 = st.columns(2)
             with b1:
                 if st.button("Prepare ≤5MB JPG", key="one5"):
-                    out = process_color(wb, sel_rgb)
+                    out, used_rgb = process_color(wb_img, sel_rgb, gains_lin, use_cal)
                     data = export_with_cap(Image.fromarray(out), 5 * 1024 * 1024)
                     st.download_button("Download ≤5MB", data=data,
                                        file_name=f"{sel_safe}.jpg", mime="image/jpeg", type="primary",
                                        key="dl_one5")
             with b2:
                 if st.button("Prepare ≤10MB JPG", key="one10"):
-                    out = process_color(wb, sel_rgb)
+                    out, used_rgb = process_color(wb_img, sel_rgb, gains_lin, use_cal)
                     data = export_with_cap(Image.fromarray(out), 10 * 1024 * 1024)
                     st.download_button("Download ≤10MB", data=data,
                                        file_name=f"{sel_safe}.jpg", mime="image/jpeg", type="primary",
                                        key="dl_one10")
 
-        # ZIP exports (one at a time)
+        # ---- ZIP exports (one at a time) ----
         st.divider()
         st.write("### Download ALL (ZIP)")
-        st.caption("Build one ZIP at a time to avoid crashes.")
+        st.caption("Build one ZIP at a time to avoid crashes. Uses calibrated targets if enabled.")
 
         img_hash = sha1_hex(img_bytes)
-        salt = f"{img_hash}|{hash(str(colors))}|bias={GLOBAL_BRIGHTNESS_BIAS}|ref={ANCHOR_REF_PCT}"
+        salt = f"{img_hash}|{hash(str(colors))}|cal={use_cal}|ref={ref_true_rgb}|bias={BASE_GLOBAL_BRIGHTNESS_BIAS}"
 
         z1, z2 = st.columns(2)
 
@@ -526,7 +610,8 @@ try:
             if st.button("Build ZIP ≤5MB", type="primary", key="zip5_build"):
                 if colors_5 and est_5 <= MAX_ZIP_MB:
                     with st.spinner("Building ZIP ≤5MB..."):
-                        zip_bytes = build_zip_for_cap(img_bytes, colors_5, cap_mb=5, cache_salt=salt)
+                        zip_bytes = build_zip_for_cap(img_bytes, colors_5, cap_mb=5, cache_salt=salt,
+                                                      use_calibration=use_cal, gains_lin_tuple=gains_lin_tuple)
                     st.download_button("Download ZIP ≤5MB", data=zip_bytes,
                                        file_name="recolored_batch_5MB_max.zip",
                                        mime="application/zip", type="primary",
@@ -540,7 +625,8 @@ try:
             if st.button("Build ZIP ≤10MB", type="primary", key="zip10_build"):
                 if colors_10 and est_10 <= MAX_ZIP_MB:
                     with st.spinner("Building ZIP ≤10MB..."):
-                        zip_bytes = build_zip_for_cap(img_bytes, colors_10, cap_mb=10, cache_salt=salt)
+                        zip_bytes = build_zip_for_cap(img_bytes, colors_10, cap_mb=10, cache_salt=salt,
+                                                      use_calibration=use_cal, gains_lin_tuple=gains_lin_tuple)
                     st.download_button("Download ZIP ≤10MB", data=zip_bytes,
                                        file_name="recolored_batch_10MB_max.zip",
                                        mime="application/zip", type="primary",
