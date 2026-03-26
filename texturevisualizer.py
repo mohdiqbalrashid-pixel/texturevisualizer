@@ -377,10 +377,8 @@ img_f = img.astype(np.float32)
 means = img_f.mean(axis=(0, 1))  # R,G,B means
 target = float(np.mean(means))
 gains = target / (means + 1e-6)
-
 st.write("Mean RGB before WB:", means)
 st.write("Gray-world gains:", gains)
-
     st.subheader("Working Image (White Balance with Luma Preserved)")
     st.image(wb, caption="This is used for recoloring", use_column_width=True)
 
