@@ -335,7 +335,10 @@ if uploaded is None:
     st.stop()
 
 try:
-    img = np.array(Image.open(uploaded).convert("RGB"))
+    
+img_bytes = uploaded.getvalue()
+img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+
 
     st.subheader("Original")
     st.image(img, caption=f"{uploaded.name} • {img.shape[1]}×{img.shape[0]}", use_column_width=True)
