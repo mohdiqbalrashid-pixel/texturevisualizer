@@ -15,16 +15,15 @@ from PIL import Image
 # Page setup
 # =========================
 st.set_page_config(page_title="Textured Paint Recolor", page_icon="🎨", layout="wide")
-st.title("🎨 Textured Paint Recolor (Shading Map Method + Batch Exports)")
-
+st.title("🎨 Textured Paint Recolor (Shading → Lab L Only, No Whitening)")
 
 # =========================
 # Constants (no sliders)
 # =========================
-# You said outputs are mostly too light -> keep this
+# User requested to keep this (fixes "mostly too light")
 OVERALL_ANCHOR_BIAS = 0.94
 
-# Highlight-aware overall impression anchoring
+# Overall impression anchoring settings (highlight-aware)
 ANCHOR_LOW_PCT = 25
 ANCHOR_HIGH_PCT = 85
 ANCHOR_REF_PCT = 70
@@ -35,11 +34,16 @@ SHADING_MID_HI = 80
 SHADING_CLAMP_LO = 0.35
 SHADING_CLAMP_HI = 2.20
 
+# Highlight compression (prevents texture highlights from turning white)
+HIGHLIGHT_COMPRESS_ABOVE_1 = 0.70
+S_COMP_CLAMP_LO = 0.40
+S_COMP_CLAMP_HI = 1.80
+
 # Stability caps for Streamlit Cloud
 MAX_COLORS_PREVIEW = 40
 MAX_COLORS_ZIP_5MB = 30
 MAX_COLORS_ZIP_10MB = 18
-MAX_ZIP_MB = 180  # rough safety limit for ZIP size to avoid browser/cloud issues
+MAX_ZIP_MB = 180  # rough safety limit for ZIP size (MB)
 
 
 # =========================
@@ -71,12 +75,12 @@ def linear_to_srgb01(x01: np.ndarray) -> np.ndarray:
 
 
 # =========================
-# (Optional) reference calibration
+# Optional reference calibration (adjust target RGBs)
 # =========================
 def robust_observed_rgb_midtone_median(img_u8: np.ndarray) -> np.ndarray:
     """
     Robust observed RGB (whole image):
-    - compute luma
+    - compute luma in sRGB
     - mask midtones (20–80%)
     - median RGB of masked region
     """
@@ -95,18 +99,14 @@ def robust_observed_rgb_midtone_median(img_u8: np.ndarray) -> np.ndarray:
     return med * 255.0
 
 def compute_reference_gains(obs_rgb_u8: np.ndarray, true_rgb_u8: Tuple[int, int, int]) -> np.ndarray:
-    """
-    gains_lin = true_lin / observed_lin   (linear RGB)
-    """
+    """gains_lin = true_lin / observed_lin (linear RGB)."""
     obs01 = srgb_to_linear01(np.array(obs_rgb_u8, dtype=np.float32) / 255.0)
     tru01 = srgb_to_linear01(np.array(true_rgb_u8, dtype=np.float32) / 255.0)
     gains = tru01 / np.maximum(obs01, 1e-6)
     return np.clip(gains, 0.5, 2.0).astype(np.float32)
 
 def apply_gains_to_target_rgb(target_rgb: Tuple[int, int, int], gains_lin: np.ndarray) -> Tuple[int, int, int]:
-    """
-    Apply gains to the requested target color (linear RGB), return corrected sRGB uint8.
-    """
+    """Apply gains to the requested target color (linear RGB), return corrected sRGB uint8."""
     t01 = np.array(target_rgb, dtype=np.float32) / 255.0
     t_lin = srgb_to_linear01(t01)
     t_lin_corr = np.clip(t_lin * gains_lin, 0.0, 1.0)
@@ -123,8 +123,8 @@ def build_shading_map_normalized(img_u8: np.ndarray) -> np.ndarray:
     Build a normalized shading/texture map S in linear space:
       - Compute linear luminance Y
       - Reference Y_ref = median of midtones (20–80%)
-      - S = Y / Y_ref  (so typical midtone shading = 1.0)
-      - Clamp & smooth to reduce extreme specular/shadow effects
+      - S = Y / Y_ref  (typical midtone shading = 1.0)
+      - Clamp & smooth
     Returns S shape (H,W,1), float32.
     """
     img01 = img_u8.astype(np.float32) / 255.0
@@ -145,35 +145,56 @@ def build_shading_map_normalized(img_u8: np.ndarray) -> np.ndarray:
 
     S = (Y / Y_ref).astype(np.float32)
 
-    # Clamp to reduce global drift from extreme lighting
+    # Clamp to reduce drift from extreme lighting
     S = np.clip(S, SHADING_CLAMP_LO, SHADING_CLAMP_HI)
 
-    # Smooth a bit but preserve edges/texture
+    # Smooth slightly but preserve edges/texture
     S = cv2.bilateralFilter(S, d=0, sigmaColor=0.08, sigmaSpace=5)
 
     return S[:, :, None]
 
-def recolor_from_shading(img_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
-    """
-    Remove original color and re-apply requested target color using shading map.
-    Output preserves texture and is stable across different input images.
-    """
-    S = build_shading_map_normalized(img_u8)  # (H,W,1)
 
-    tgt01 = np.array(target_rgb, dtype=np.float32) / 255.0
-    tgt_lin = srgb_to_linear01(tgt01)[None, None, :]  # (1,1,3)
-
-    out_lin = np.clip(tgt_lin * S, 0.0, 1.0)
-    out01 = linear_to_srgb01(out_lin)
-    out_u8 = (np.clip(out01 * 255.0 + 0.5, 0, 255)).astype(np.uint8)
-    return out_u8
-
-def anchor_overall_impression(output_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
+def recolor_from_shading_lab(img_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
     """
-    Fix cases where output is too light/dark overall by anchoring perceived brightness
-    to target RGB. Uses highlight-aware reference and applies s *= 0.94.
+    Apply shading to Lab Lightness only:
+    - Build normalized shading map S
+    - Compress highlights (S > 1)
+    - Convert target RGB -> Lab, keep target a/b constant
+    - Set output L = target_L * S_comp
+    This prevents whitening caused by RGB multiplication + clipping.
+    """
+    # shading map S in (H,W,1)
+    S = build_shading_map_normalized(img_u8)[:, :, 0]  # (H,W)
+
+    # Compress highlights above 1.0 to avoid blowing out to white
+    S_comp = np.where(S > 1.0, 1.0 + (S - 1.0) * HIGHLIGHT_COMPRESS_ABOVE_1, S)
+    S_comp = np.clip(S_comp, S_COMP_CLAMP_LO, S_COMP_CLAMP_HI)
+
+    # Target LAB (OpenCV scale)
+    tbgr = np.array([[[target_rgb[2], target_rgb[1], target_rgb[0]]]], dtype=np.uint8)
+    t_lab = cv2.cvtColor(tbgr, cv2.COLOR_BGR2LAB)[0, 0]  # uint8 [L,a,b]
+    tL, tA, tB = float(t_lab[0]), int(t_lab[1]), int(t_lab[2])
+
+    # Output LAB: L varies with shading, a/b fixed to target
+    L_out = np.clip(tL * S_comp, 0, 255).astype(np.uint8)
+    a_out = np.full_like(L_out, tA, dtype=np.uint8)
+    b_out = np.full_like(L_out, tB, dtype=np.uint8)
+
+    lab_out = cv2.merge([L_out, a_out, b_out])
+    rgb_out = cv2.cvtColor(lab_out, cv2.COLOR_LAB2RGB)
+    return rgb_out
+
+
+def anchor_overall_impression_L_only(output_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
+    """
+    Overall impression brightness correction:
+    - compute perceived luma in sRGB
+    - compute scale s with s *= 0.94 (user requested)
+    - apply s to Lab L only (preserves chroma; avoids whitening)
     """
     img = output_u8.astype(np.float32) / 255.0
+
+    # sRGB luma proxy (perceptual)
     Y = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
 
     p_lo, p_hi = np.percentile(Y, ANCHOR_LOW_PCT), np.percentile(Y, ANCHOR_HIGH_PCT)
@@ -181,6 +202,7 @@ def anchor_overall_impression(output_u8: np.ndarray, target_rgb: Tuple[int, int,
     if np.count_nonzero(mid) < 1000:
         mid = np.ones_like(Y, dtype=bool)
 
+    # Highlight-aware reference for textured surfaces
     y_ref = float(np.percentile(Y[mid], ANCHOR_REF_PCT))
 
     tr, tg, tb = [v / 255.0 for v in target_rgb]
@@ -189,8 +211,13 @@ def anchor_overall_impression(output_u8: np.ndarray, target_rgb: Tuple[int, int,
     s = (y_tgt / (y_ref + 1e-6)) * OVERALL_ANCHOR_BIAS
     s = float(np.clip(s, 0.70, 1.20))
 
-    out = np.clip(img * s, 0.0, 1.0)
-    return (out * 255.0 + 0.5).astype(np.uint8)
+    # Apply only to Lab L channel
+    lab = cv2.cvtColor(output_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[:, :, 0] = np.clip(lab[:, :, 0] * s, 0, 255)
+
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return out
+
 
 def process_color(base_img_u8: np.ndarray,
                   requested_target_rgb: Tuple[int, int, int],
@@ -199,8 +226,8 @@ def process_color(base_img_u8: np.ndarray,
     """
     Pipeline:
       1) Optionally correct requested target using reference gains
-      2) Shading-map recolor (paint target on texture)
-      3) Overall impression anchor (fix too light/dark overall)
+      2) Shading-map recolor in Lab L-only (prevents whitening)
+      3) Overall impression anchor in Lab L-only (keeps chroma)
     Returns (output_image, used_target_rgb)
     """
     if use_calibration and gains_lin is not None:
@@ -208,8 +235,8 @@ def process_color(base_img_u8: np.ndarray,
     else:
         used_target = requested_target_rgb
 
-    out = recolor_from_shading(base_img_u8, used_target)
-    out = anchor_overall_impression(out, used_target)
+    out = recolor_from_shading_lab(base_img_u8, used_target)
+    out = anchor_overall_impression_L_only(out, used_target)
     return out, used_target
 
 
@@ -398,7 +425,7 @@ def build_zip_for_cap(img_bytes: bytes,
 # =========================
 # UI
 # =========================
-uploaded = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"], key="uploader_shading")
+uploaded = st.file_uploader("Upload a textured paint image", type=["jpg", "jpeg", "png"], key="uploader_shading_lab")
 
 if uploaded is None:
     st.info("Upload a photo to begin.")
@@ -408,7 +435,7 @@ try:
     img_bytes, img = load_uploaded_image_bytes(uploaded)
 
     # ---- Reference calibration inputs ----
-    st.subheader("Reference calibration (optional, but recommended for consistency)")
+    st.subheader("Reference calibration (optional)")
     c0, c1, c2, c3 = st.columns([1.4, 1, 1, 1])
     with c0:
         use_cal = st.checkbox("Use reference calibration", value=True)
@@ -421,7 +448,6 @@ try:
 
     ref_true_rgb = (int(ref_r), int(ref_g), int(ref_b))
 
-    # Observed RGBs for debug
     obs_mean = mean_rgb(img)
     obs_med = robust_observed_rgb_midtone_median(img)
 
@@ -442,7 +468,7 @@ try:
             st.write("Linear gains (R,G,B):", [float(f"{g:.6f}") for g in gains_lin])
 
     st.subheader("Original Image")
-    st.image(img, caption=f"{uploaded.name} • {img.shape[1]}×{img.shape[0]}", use_column_width=True)
+    st.image(img, caption=f"{uploaded.name} • {img.shape[1]}×{img.shape[0]}", width="stretch")  # width API [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
 
     tab_single, tab_batch = st.tabs(["Single color", "Batch colors"])
 
@@ -465,7 +491,7 @@ try:
         if st.button("Recolor", type="primary", key="single_go"):
             out, used_rgb = process_color(img, requested_rgb, use_cal, gains_lin)
             st.caption(f"Requested RGB: {requested_rgb}  →  Used RGB: {used_rgb}")
-            st.image(out, caption=f"{name} • RGB{requested_rgb}", use_column_width=True)
+            st.image(out, caption=f"{name} • RGB{requested_rgb}", width="stretch")  # width API [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
 
             data5 = export_with_cap(Image.fromarray(out), 5 * 1024 * 1024)
             data10 = export_with_cap(Image.fromarray(out), 10 * 1024 * 1024)
@@ -528,7 +554,7 @@ try:
             for idx, (nm, rgb) in enumerate(colors[:MAX_COLORS_PREVIEW]):
                 prev, used_rgb = process_color(preview_base, rgb, use_cal, gains_lin)
                 with cols_ui[idx % 3]:
-                    st.image(prev, caption=f"{nm} • RGB{rgb}", use_column_width=True)
+                    st.image(prev, caption=f"{nm} • RGB{rgb}", width="stretch")  # width API [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
 
             st.session_state["last_colors"] = colors
 
