@@ -3,7 +3,7 @@ import csv
 import zipfile
 import hashlib
 import traceback
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
 import numpy as np
 import cv2
@@ -15,14 +15,16 @@ from PIL import Image
 # Page setup
 # =========================
 st.set_page_config(page_title="Textured Paint Recolor", page_icon="🎨", layout="wide")
-st.title("🎨 Textured Paint Recolor (Swatches + Retouch)")
+st.title("🎨 Textured Paint Recolor (Swatches + Retouch + Faster Previews)")
+
 
 # =========================
-# UI size controls (preview only)
+# UI sizes (preview only)
 # =========================
-UPLOAD_PREVIEW_MAX_W = 650     # smaller uploaded preview
-OUTPUT_PREVIEW_MAX_W = 850     # output preview width
-SWATCH_W, SWATCH_H = 150, 100  # swatch size
+UPLOAD_PREVIEW_MAX_W = 650      # Smaller uploaded preview (also used for batch tiles)
+OUTPUT_PREVIEW_MAX_W = 850      # Output preview width (single view)
+SWATCH_W, SWATCH_H = 150, 100   # Swatch size
+
 
 # =========================
 # Streamlit Cloud stability caps
@@ -30,12 +32,14 @@ SWATCH_W, SWATCH_H = 150, 100  # swatch size
 MAX_COLORS_PREVIEW = 40
 MAX_COLORS_ZIP_5MB = 30
 MAX_COLORS_ZIP_10MB = 18
-MAX_ZIP_MB = 180  # rough ZIP size estimate guard
+MAX_ZIP_MB = 180  # Rough ZIP size estimate guard (MB)
+
 
 # =========================
 # Overall impression tuning (no sliders)
 # =========================
-GLOBAL_BRIGHTNESS_BIAS = 0.94  # you calibrated this earlier
+# You calibrated this earlier when results were generally slightly light
+GLOBAL_BRIGHTNESS_BIAS = 0.94
 
 ANCHOR_LOW_PCT = 25
 ANCHOR_HIGH_PCT = 85
@@ -43,9 +47,17 @@ ANCHOR_REF_PCT = 70
 
 
 # =========================
+# JPEG export caps
+# =========================
+CAP_5MB = 5 * 1024 * 1024
+CAP_10MB = 10 * 1024 * 1024
+
+
+# =========================
 # Helpers: robust upload + preview + filenames
 # =========================
 def load_uploaded_image_bytes(uploaded_file) -> Tuple[bytes, np.ndarray]:
+    """Always load from bytes to avoid pointer/caching issues."""
     img_bytes = uploaded_file.getvalue()
     img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
     return img_bytes, img
@@ -54,6 +66,7 @@ def sha1_hex(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
 def make_small_preview(img_u8: np.ndarray, max_w: int) -> np.ndarray:
+    """Downscale only for display (processing still uses full-res)."""
     h, w = img_u8.shape[:2]
     if w <= max_w:
         return img_u8
@@ -63,6 +76,7 @@ def make_small_preview(img_u8: np.ndarray, max_w: int) -> np.ndarray:
     return cv2.resize(img_u8, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 def sanitize_filename(name: str) -> str:
+    """Safe filenames: letters/numbers/space/-/_ ; spaces->underscores; others->underscore."""
     safe = []
     for ch in name:
         if ch.isalnum() or ch in (" ", "-", "_"):
@@ -83,6 +97,10 @@ def rgb_swatch(rgb: Tuple[int, int, int], w: int = SWATCH_W, h: int = SWATCH_H) 
 # White balance (internal, mild + luminance-preserving)
 # =========================
 def white_balance_preserve_luma(img_rgb: np.ndarray) -> np.ndarray:
+    """
+    Gray-world WB but preserve overall luminance so WB doesn't brighten/darken globally.
+    Often close to identity if the image is already neutral.
+    """
     img = img_rgb.astype(np.float32)
     means = img.mean(axis=(0, 1))  # [R,G,B]
     target = float(np.mean(means))
@@ -101,12 +119,16 @@ def white_balance_preserve_luma(img_rgb: np.ndarray) -> np.ndarray:
 # Stable Lab recolor pipeline (texture preserved)
 # =========================
 def rgb_to_lab_color(rgb: Tuple[int, int, int]) -> np.ndarray:
+    """Convert (R,G,B) to LAB in OpenCV uint8 scale (0..255)."""
     r, g, b = [int(max(0, min(255, v))) for v in rgb]
     bgr = np.array([[[b, g, r]]], dtype=np.uint8)
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    return lab[0, 0]  # (L,a,b) in 0..255
+    return lab[0, 0]  # (L,a,b)
 
 def adjust_lightness_to_target(L: np.ndarray, target_L: float) -> np.ndarray:
+    """
+    Robustly remap L so median moves to target_L while preserving contrast and avoiding clipping.
+    """
     Lf = L.astype(np.float32)
     p10 = np.percentile(Lf, 10.0)
     p50 = np.percentile(Lf, 50.0)
@@ -125,6 +147,12 @@ def adjust_lightness_to_target(L: np.ndarray, target_L: float) -> np.ndarray:
     return np.clip(L_adj, 0, 255).astype(np.uint8)
 
 def recolor_lab_texture_preserved(img_rgb: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
+    """
+    Stable method:
+      - Convert to LAB
+      - Remap L robustly toward target_L (preserves texture contrast)
+      - Apply target chroma with soft mix (avoids artifacts for near-neutrals)
+    """
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
     L = lab[:, :, 0]
     orig_a = lab[:, :, 1].astype(np.float32)
@@ -152,6 +180,13 @@ def recolor_lab_texture_preserved(img_rgb: np.ndarray, target_rgb: Tuple[int, in
     return cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB)
 
 def anchor_overall_impression_L_only(output_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
+    """
+    Final overall-impression correction (perceptual proxy):
+    - compute sRGB luma
+    - reference = 70th percentile within 25–85% band (highlight-aware)
+    - apply bias 0.94 (because results tend to be slightly light)
+    - apply scaling to Lab L only (preserves chroma)
+    """
     img = output_u8.astype(np.float32) / 255.0
     Y = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
 
@@ -179,13 +214,13 @@ def process_color(base_img_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> 
 
 
 # =========================
-# Effective midtone average (for 2nd swatch)
+# Effective midtone average (2nd swatch)
 # =========================
 def effective_midtone_avg_rgb(img_u8: np.ndarray) -> Tuple[int, int, int]:
     """
-    Compute effective midtone average RGB:
+    Effective midtone avg RGB:
     - Compute sRGB luma
-    - Keep 25–85% luma band (ignore extreme shadows/highlights)
+    - Keep 25–85% luma band
     - Mean RGB within band
     """
     img = img_u8.astype(np.float32) / 255.0
@@ -202,19 +237,18 @@ def effective_midtone_avg_rgb(img_u8: np.ndarray) -> Tuple[int, int, int]:
 
 
 # =========================
-# Retouch: auto-correct output toward requested RGB (no sliders)
+# Retouch: pull output toward requested RGB (no sliders)
 # =========================
 def retouch_toward_target(output_u8: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
     """
     Retouch pass:
-    - Measure effective midtone avg RGB of the current output
+    - Measure effective midtone avg RGB of current output
     - Convert both current and target to Lab
-    - Apply global delta to a/b (chroma) and gentle scale to L
-    This pulls the output closer to the requested RGB without destroying texture.
+    - Apply global delta to a/b and gentle scale to L around median
+    - Re-anchor overall impression
     """
     current_rgb = effective_midtone_avg_rgb(output_u8)
 
-    # Convert current & target to Lab (OpenCV scale)
     cur_bgr = np.array([[[current_rgb[2], current_rgb[1], current_rgb[0]]]], dtype=np.uint8)
     tgt_bgr = np.array([[[target_rgb[2], target_rgb[1], target_rgb[0]]]], dtype=np.uint8)
     cur_lab = cv2.cvtColor(cur_bgr, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
@@ -226,21 +260,17 @@ def retouch_toward_target(output_u8: np.ndarray, target_rgb: Tuple[int, int, int
 
     lab = cv2.cvtColor(output_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-    # Apply chroma correction fully (global shift)
+    # Apply chroma correction (global shift)
     lab[:, :, 1] = np.clip(lab[:, :, 1] + da, 0, 255)
     lab[:, :, 2] = np.clip(lab[:, :, 2] + db, 0, 255)
 
-    # Apply lightness correction gently (scale around median to preserve texture)
+    # Gentle lightness correction (scale around median to keep texture)
     L = lab[:, :, 0]
     p50 = np.percentile(L, 50.0)
-    # Convert dL to a scale factor around 1.0, clamped
-    # small correction: +20 L -> scale about 1.08; -20 -> 0.92
     sL = float(np.clip(1.0 + (dL / 255.0) * 1.0, 0.85, 1.15))
     lab[:, :, 0] = np.clip((L - p50) * sL + p50, 0, 255)
 
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-
-    # Run the overall anchor again to stabilize perceived brightness
     out = anchor_overall_impression_L_only(out, target_rgb)
     return out
 
@@ -256,6 +286,10 @@ def _jpeg_bytes(img: Image.Image, quality: int) -> bytes:
 def export_with_cap(pil_img: Image.Image, cap_bytes: int,
                     min_quality: int = 40, max_quality: int = 95,
                     max_downscales: int = 5) -> bytes:
+    """
+    Export JPEG bytes <= cap_bytes using binary search on quality,
+    then downscale if needed.
+    """
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
 
@@ -322,6 +356,7 @@ def parse_rgb_lines(text: str) -> List[Tuple[str, Tuple[int, int, int]]]:
 
         parts = [p.strip() for p in line.replace("\t", " ").split(",")]
 
+        # name,r,g,b
         if len(parts) == 4 and all(parts):
             name = parts[0]
             try:
@@ -332,6 +367,7 @@ def parse_rgb_lines(text: str) -> List[Tuple[str, Tuple[int, int, int]]]:
             except ValueError:
                 pass
 
+        # r,g,b
         if len(parts) == 3:
             try:
                 r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
@@ -341,6 +377,7 @@ def parse_rgb_lines(text: str) -> List[Tuple[str, Tuple[int, int, int]]]:
             except ValueError:
                 pass
 
+        # hex anywhere
         words = line.replace(",", " ").split()
         hex_rgb = None
         for w in words:
@@ -405,7 +442,6 @@ def build_zip_for_cap(img_bytes: bytes,
             out = process_color(base_img, rgb)
             if do_retouch:
                 out = retouch_toward_target(out, rgb)
-
             data = export_with_cap(Image.fromarray(out), cap_bytes)
             zf.writestr(f"{sanitize_filename(name)}.jpg", data)
     return zip_buf.getvalue()
@@ -425,7 +461,7 @@ try:
 
     # Smaller uploaded preview
     st.subheader("Uploaded image (small preview)")
-    st.image(make_small_preview(img, UPLOAD_PREVIEW_MAX_W), caption=uploaded.name, width="content")  # [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
+    st.image(make_small_preview(img, UPLOAD_PREVIEW_MAX_W), caption=uploaded.name, width="content")
 
     tab_single, tab_batch = st.tabs(["Single color", "Batch colors"])
 
@@ -452,30 +488,24 @@ try:
             out = process_color(base_img, target_rgb)
             st.session_state["single_out"] = out
 
-        # Show results if available
         if st.session_state["single_out"] is not None:
             out = st.session_state["single_out"]
-
-            # Compute effective midtone average for second swatch
             mid_rgb = effective_midtone_avg_rgb(out)
 
-            # Side-by-side: output + swatches
             col_img, col_sw = st.columns([4, 1], vertical_alignment="top")
             with col_img:
                 st.image(make_small_preview(out, OUTPUT_PREVIEW_MAX_W),
                          caption=f"{name} • Requested RGB{target_rgb}",
-                         width="stretch")  # [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
+                         width="stretch")
             with col_sw:
-                st.image(rgb_swatch(target_rgb), caption=f"Requested\n{target_rgb}", width="content")  # [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
-                st.image(rgb_swatch(mid_rgb), caption=f"Effective\n{mid_rgb}", width="content")       # [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
+                st.image(rgb_swatch(target_rgb), caption=f"Requested\n{target_rgb}", width="content")
+                st.image(rgb_swatch(mid_rgb), caption=f"Effective\n{mid_rgb}", width="content")
 
-            # Retouch button
             if st.button("Retouch to match requested color", key="retouch_btn"):
                 out2 = retouch_toward_target(out, target_rgb)
                 st.session_state["single_out"] = out2
                 st.toast("Retouch applied.", icon="✅")
 
-            # Downloads
             data5 = export_with_cap(Image.fromarray(st.session_state["single_out"]), CAP_5MB)
             data10 = export_with_cap(Image.fromarray(st.session_state["single_out"]), CAP_10MB)
 
@@ -523,27 +553,27 @@ try:
 
         st.write(f"**Detected {len(colors)} color(s).**")
 
-        # Previews
         if st.button("Generate previews", type="primary", key="prev_go"):
             st.subheader("Previews")
             cols_ui = st.columns(3)
-            preview_base = make_small_preview(base_img, BATCH_PREVIEW_MAX_W)
+
+            # IMPORTANT FIX: use UPLOAD_PREVIEW_MAX_W for batch tiles (lighter/faster)
+            preview_base = make_small_preview(base_img, UPLOAD_PREVIEW_MAX_W)
 
             for idx, (nm, rgb) in enumerate(colors[:MAX_COLORS_PREVIEW]):
                 prev = process_color(preview_base, rgb)
                 mid_rgb = effective_midtone_avg_rgb(prev)
 
                 with cols_ui[idx % 3]:
-                    st.image(prev, caption=f"{nm} • RGB{rgb}", width="stretch")  # [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
-                    cimg, cs = st.columns([1, 1])
-                    with cimg:
-                        st.image(rgb_swatch(rgb), caption="Requested", width="content")  # [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
-                    with cs:
-                        st.image(rgb_swatch(mid_rgb), caption="Effective", width="content")  # [1](https://docs.streamlit.io/develop/api-reference/media/st.image)
+                    st.image(prev, caption=f"{nm} • RGB{rgb}", width="stretch")
+                    sw1, sw2 = st.columns(2)
+                    with sw1:
+                        st.image(rgb_swatch(rgb), caption="Requested", width="content")
+                    with sw2:
+                        st.image(rgb_swatch(mid_rgb), caption="Effective", width="content")
 
             st.session_state["last_colors"] = colors
 
-        # Download one (on demand)
         st.divider()
         st.write("### Download one (on-demand)")
         colors_for_select = st.session_state.get("last_colors", colors)
@@ -573,21 +603,23 @@ try:
                                        file_name=f"{sel_safe}.jpg", mime="image/jpeg", type="primary",
                                        key="dl_one10")
 
-        # ZIP exports (one at a time)
         st.divider()
         st.write("### Download ALL (ZIP)")
         st.caption("Build one ZIP at a time to avoid crashes.")
 
+        est5 = min(len(colors), MAX_COLORS_ZIP_5MB) * 5
+        est10 = min(len(colors), MAX_COLORS_ZIP_10MB) * 10
+
         salt = f"{sha1_hex(img_bytes)}|{hash(str(colors))}|retouch={do_retouch_batch}"
 
         z1, z2 = st.columns(2)
+
         with z1:
-            colors_5 = colors[:MAX_COLORS_ZIP_5MB]
-            est_5 = len(colors_5) * 5
-            if est_5 > MAX_ZIP_MB:
-                st.warning(f"≤5MB ZIP estimate {est_5}MB exceeds {MAX_ZIP_MB}MB. Reduce colors.")
+            if est5 > MAX_ZIP_MB:
+                st.warning(f"≤5MB ZIP estimate {est5}MB exceeds {MAX_ZIP_MB}MB. Reduce colors.")
             if st.button("Build ZIP ≤5MB", type="primary", key="zip5_build"):
-                if colors_5 and est_5 <= MAX_ZIP_MB:
+                colors_5 = colors[:MAX_COLORS_ZIP_5MB]
+                if colors_5 and (len(colors_5) * 5) <= MAX_ZIP_MB:
                     with st.spinner("Building ZIP ≤5MB..."):
                         zip_bytes = build_zip_for_cap(img_bytes, colors_5, cap_mb=5, cache_salt=salt, do_retouch=do_retouch_batch)
                     st.download_button("Download ZIP ≤5MB", data=zip_bytes,
@@ -596,12 +628,11 @@ try:
                                        key="zip5_dl")
 
         with z2:
-            colors_10 = colors[:MAX_COLORS_ZIP_10MB]
-            est_10 = len(colors_10) * 10
-            if est_10 > MAX_ZIP_MB:
-                st.warning(f"≤10MB ZIP estimate {est_10}MB exceeds {MAX_ZIP_MB}MB. Reduce colors.")
+            if est10 > MAX_ZIP_MB:
+                st.warning(f"≤10MB ZIP estimate {est10}MB exceeds {MAX_ZIP_MB}MB. Reduce colors.")
             if st.button("Build ZIP ≤10MB", type="primary", key="zip10_build"):
-                if colors_10 and est_10 <= MAX_ZIP_MB:
+                colors_10 = colors[:MAX_COLORS_ZIP_10MB]
+                if colors_10 and (len(colors_10) * 10) <= MAX_ZIP_MB:
                     with st.spinner("Building ZIP ≤10MB..."):
                         zip_bytes = build_zip_for_cap(img_bytes, colors_10, cap_mb=10, cache_salt=salt, do_retouch=do_retouch_batch)
                     st.download_button("Download ZIP ≤10MB", data=zip_bytes,
