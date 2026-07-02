@@ -15,7 +15,7 @@ from PIL import Image
 # Page setup
 # =========================
 st.set_page_config(page_title="Textured Paint Recolor", page_icon="🎨", layout="wide")
-st.title("🎨 Textured Paint Recolor (Swatches + Retouch + Faster Previews)")
+st.title("🎨 Texture Visualizer")
 
 
 # =========================
